@@ -88,17 +88,14 @@ st.markdown(
       .result-title { font-size: 1.03rem; font-weight: 800; color: #0f172a; margin-bottom: 0.3rem; }
       .result-meta { color: #6b7280; font-size: 0.88rem; margin-bottom: 0.55rem; }
       .result-date-red { color: #b91c1c; font-weight: 800; }
-      .result-body {
-        line-height: 1.65;
-        font-size: 0.98rem;
-        color: #111827;
+      .body-box {
         background: #f8fafc;
         border: 1px solid #edf2f7;
-        padding: 0.95rem;
         border-radius: 14px;
+        padding: 0.95rem 1rem;
       }
-      .result-body p { margin: 0 0 0.9rem 0; }
-      .result-body a {
+      .body-box p { margin: 0 0 0.9rem 0; }
+      .body-box a {
         white-space: nowrap;
         display: inline-block;
         word-break: normal;
@@ -485,7 +482,12 @@ def render_result_card(item: ParsedEmail, search_term: str, highlight_latest: bo
         unsafe_allow_html=True,
     )
 
-    st.markdown(f"<div class='result-body'>{item.body_markdown}</div>", unsafe_allow_html=True)
+    # Important: render body separately and as markdown, not inside the HTML card.
+    body_md = item.body_markdown.strip() or "(No readable body found)"
+    st.markdown(
+        f"<div class='body-box'>\n\n{body_md}\n\n</div>",
+        unsafe_allow_html=True,
+    )
 
     with st.expander("Show match details", expanded=False):
         st.write(f"Matched reason: {item.match_reason or 'n/a'}")
@@ -518,7 +520,11 @@ with st.sidebar:
     )
 
     st.markdown("### Controls")
-    st.session_state.sort_order = st.radio("Sort order", ["Oldest first", "Newest first"], index=0 if st.session_state.sort_order == "Oldest first" else 1)
+    st.session_state.sort_order = st.radio(
+        "Sort order",
+        ["Oldest first", "Newest first"],
+        index=0 if st.session_state.sort_order == "Oldest first" else 1,
+    )
     if st.button("Clear Search", use_container_width=True):
         reset_search()
 
@@ -572,7 +578,10 @@ if do_search:
                 item.match_reason = reason
                 item.completed_flag = completed_flag
                 results.append(item)
-        st.session_state.search_results = sorted(results, key=lambda item: sort_key(item, st.session_state.sort_order == "Newest first"))
+        st.session_state.search_results = sorted(
+            results,
+            key=lambda item: sort_key(item, st.session_state.sort_order == "Newest first"),
+        )
 
 if st.session_state.parsed_emails:
     total = len(st.session_state.parsed_emails)
