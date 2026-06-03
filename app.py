@@ -30,83 +30,57 @@ st.markdown(
     """
     <style>
       .stApp {
-        background:
-          radial-gradient(circle at top left, rgba(37,99,235,0.10), transparent 28%),
-          radial-gradient(circle at top right, rgba(20,184,166,0.08), transparent 24%),
-          linear-gradient(180deg, #f8fbff 0%, #ffffff 34%, #f7f9fc 100%);
+        background: linear-gradient(180deg, #f8fbff 0%, #ffffff 35%, #f7f9fc 100%);
       }
       .hero {
-        padding: 1.05rem 1.2rem 0.95rem 1.2rem;
-        border-radius: 22px;
-        background: linear-gradient(135deg, rgba(37,99,235,0.13), rgba(14,165,233,0.09), rgba(20,184,166,0.07));
-        border: 1px solid rgba(91,120,180,0.16);
-        box-shadow: 0 10px 30px rgba(15,23,42,0.06);
-        margin-bottom: 0.65rem;
-      }
-      .hero h1 { margin: 0; font-size: 2.1rem; line-height: 1.08; }
-      .result-card {
-        background: rgba(255,255,255,0.96);
-        border: 1px solid #e5e7eb;
-        border-radius: 18px;
-        padding: 1rem 1rem 0.9rem 1rem;
+        padding: 1rem 1.2rem;
+        border-radius: 20px;
+        background: linear-gradient(135deg, rgba(37,99,235,0.10), rgba(20,184,166,0.06));
+        border: 1px solid rgba(91,120,180,0.15);
         box-shadow: 0 8px 24px rgba(15,23,42,0.05);
+        margin-bottom: 0.8rem;
+      }
+      .hero h1 {
+        margin: 0;
+        font-size: 2rem;
+        line-height: 1.1;
+      }
+      .card-title {
+        font-size: 1.02rem;
+        font-weight: 800;
+        color: #0f172a;
+        margin-bottom: 0.25rem;
+      }
+      .muted {
+        color: #6b7280;
+        font-size: 0.92rem;
+      }
+      .msg-box {
+        border: 1px solid #e5e7eb;
+        border-radius: 16px;
+        background: #fff;
+        padding: 1rem;
+        box-shadow: 0 8px 20px rgba(15,23,42,0.05);
         margin-bottom: 0.9rem;
       }
-      .pill {
-        display: inline-block;
-        background: #e0f2fe;
-        color: #075985;
-        padding: 0.28rem 0.58rem;
-        border-radius: 999px;
-        font-size: 0.81rem;
-        font-weight: 700;
-        margin-right: 0.35rem;
-        margin-bottom: 0.25rem;
-      }
-      .pill-green {
-        display: inline-block;
-        background: #dcfce7;
-        color: #166534;
-        padding: 0.28rem 0.58rem;
-        border-radius: 999px;
-        font-size: 0.81rem;
-        font-weight: 700;
-        margin-right: 0.35rem;
-        margin-bottom: 0.25rem;
-      }
-      .pill-red {
-        display: inline-block;
-        background: #fee2e2;
-        color: #991b1b;
-        padding: 0.28rem 0.58rem;
-        border-radius: 999px;
-        font-size: 0.81rem;
-        font-weight: 800;
-        margin-right: 0.35rem;
-        margin-bottom: 0.25rem;
-      }
-      .result-title { font-size: 1.03rem; font-weight: 800; color: #0f172a; margin-bottom: 0.3rem; }
-      .result-meta { color: #6b7280; font-size: 0.88rem; margin-bottom: 0.55rem; }
-      .result-date-red { color: #b91c1c; font-weight: 800; }
-      .body-box {
+      .msg-body {
         background: #f8fafc;
         border: 1px solid #edf2f7;
         border-radius: 14px;
         padding: 0.95rem 1rem;
+        line-height: 1.65;
+        font-size: 0.98rem;
+        color: #111827;
       }
-      .body-box p { margin: 0 0 0.9rem 0; }
-      .body-box a {
+      .msg-body p { margin: 0 0 0.85rem 0; }
+      .msg-body a {
         white-space: nowrap;
-        display: inline-block;
-        word-break: normal;
         overflow-wrap: normal;
+        word-break: normal;
       }
-      .small-note { color: #6b7280; font-size: 0.88rem; }
-      hr.soft { border: none; border-top: 1px solid #e5e7eb; margin: 0.75rem 0 1rem 0; }
       div[data-baseweb="input"] input { border-radius: 14px !important; }
       div[data-baseweb="textarea"] textarea { border-radius: 14px !important; }
       .stDownloadButton button { border-radius: 14px !important; font-weight: 700; }
-      a { text-decoration: none; }
     </style>
     """,
     unsafe_allow_html=True,
@@ -126,7 +100,7 @@ class ParsedEmail:
     ids_in_order: list[str]
     display_id: Optional[str]
     body_markdown: str
-    combined_text: str
+    full_text: str
     match_reason: str = ""
     completed_flag: bool = False
 
@@ -355,8 +329,8 @@ def parse_message(idx: int, msg: Message) -> ParsedEmail:
         body_markdown = extract_plain_between_separators(plain_body)
         full_text = plain_body
 
-    combined = clean_text(f"{subject}\n{full_text}\n{body_markdown}")
-    ids = extract_ids(combined)
+    full_text = clean_text(full_text)
+    ids = extract_ids(f"{subject}\n{full_text}\n{body_markdown}")
     display_id = extract_display_id(ids)
 
     return ParsedEmail(
@@ -367,7 +341,7 @@ def parse_message(idx: int, msg: Message) -> ParsedEmail:
         ids_in_order=ids,
         display_id=display_id,
         body_markdown=body_markdown,
-        combined_text=combined,
+        full_text=full_text,
     )
 
 
@@ -423,7 +397,7 @@ def parse_uploaded_file(uploaded_bytes: bytes, filename: str) -> list[ParsedEmai
 
 
 def should_mark_completed(item: ParsedEmail, names: list[str]) -> bool:
-    return bool(names) and bool(COMPLETED_RE.search(item.combined_text)) and contains_any_person(item.combined_text, names)
+    return bool(names) and bool(COMPLETED_RE.search(item.full_text)) and contains_any_person(item.full_text, names)
 
 
 def match_message(item: ParsedEmail, term: str, names_for_completed: list[str]) -> tuple[bool, str, bool]:
@@ -433,7 +407,7 @@ def match_message(item: ParsedEmail, term: str, names_for_completed: list[str]) 
     if term in item.ids_in_order:
         return True, "matched extracted ID", should_mark_completed(item, names_for_completed)
 
-    raw = item.combined_text
+    raw = f"{item.subject}\n{item.full_text}"
     if re.search(rf"(?is)GTS(?:[-_\s]*\d+)?[-_\s]*{re.escape(term)}(?!\d)", raw):
         return True, "matched flexible GTS token in raw text", should_mark_completed(item, names_for_completed)
 
@@ -463,31 +437,18 @@ def build_csv(rows: list[ParsedEmail], search_term: str) -> bytes:
 
 def render_result_card(item: ParsedEmail, search_term: str, highlight_latest: bool) -> None:
     matched_id = f"GTS{item.display_id}" if item.display_id else "—"
-    date_text = html.escape(fmt_dt(item.date_utc))
+    date_text = fmt_dt(item.date_utc)
     if highlight_latest:
-        date_text = f'<span class="result-date-red">{date_text}</span>'
+        date_text = f":red[{date_text}]"
 
-    st.markdown(
-        f"""
-        <div class="result-card">
-          <div class="result-title">{html.escape(item.subject)}</div>
-          <div class="result-meta">
-            <span class="pill">Search ID: {html.escape(search_term)}</span>
-            <span class="pill-green">Matched: {html.escape(matched_id)}</span>
-            {"<span class='pill-red'>Completed</span>" if item.completed_flag else ""}
-          </div>
-          <div class="result-meta">From: {html.escape(item.sender)} • {date_text}</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+    st.markdown(f"**{html.escape(item.subject)}**")
+    badge_line = f":blue[Search ID: {search_term}] :green[Matched: {matched_id}]"
+    if item.completed_flag:
+        badge_line += " :red[Completed]"
+    st.markdown(badge_line)
+    st.caption(f"From: {item.sender} • {date_text}")
 
-    # Important: render body separately and as markdown, not inside the HTML card.
-    body_md = item.body_markdown.strip() or "(No readable body found)"
-    st.markdown(
-        f"<div class='body-box'>\n\n{body_md}\n\n</div>",
-        unsafe_allow_html=True,
-    )
+    st.markdown(f"<div class='msg-box'><div class='msg-body'>{item.body_markdown}</div></div>", unsafe_allow_html=True)
 
     with st.expander("Show match details", expanded=False):
         st.write(f"Matched reason: {item.match_reason or 'n/a'}")
@@ -501,14 +462,7 @@ st.session_state.setdefault("sort_order", "Oldest first")
 st.session_state.setdefault("search_term_input", "")
 st.session_state.setdefault("names_text", "")
 
-st.markdown(
-    """
-    <div class="hero">
-      <h1>Wordbee Message Tracker</h1>
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
+st.markdown("<div class='hero'><h1>Wordbee Message Tracker</h1></div>", unsafe_allow_html=True)
 
 with st.sidebar:
     st.markdown("### Completed badge names")
@@ -520,11 +474,7 @@ with st.sidebar:
     )
 
     st.markdown("### Controls")
-    st.session_state.sort_order = st.radio(
-        "Sort order",
-        ["Oldest first", "Newest first"],
-        index=0 if st.session_state.sort_order == "Oldest first" else 1,
-    )
+    st.session_state.sort_order = st.radio("Sort order", ["Oldest first", "Newest first"], index=0 if st.session_state.sort_order == "Oldest first" else 1)
     if st.button("Clear Search", use_container_width=True):
         reset_search()
 
@@ -578,10 +528,7 @@ if do_search:
                 item.match_reason = reason
                 item.completed_flag = completed_flag
                 results.append(item)
-        st.session_state.search_results = sorted(
-            results,
-            key=lambda item: sort_key(item, st.session_state.sort_order == "Newest first"),
-        )
+        st.session_state.search_results = sorted(results, key=lambda item: sort_key(item, st.session_state.sort_order == "Newest first"))
 
 if st.session_state.parsed_emails:
     total = len(st.session_state.parsed_emails)
