@@ -2,19 +2,17 @@ import csv
 import html
 import io
 import mailbox
-import os
 import re
 import tempfile
-import zipfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from email import message_from_bytes
 from email.message import Message
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Optional
 
 import streamlit as st
+
 
 st.set_page_config(
     page_title="Wordbee Mail Explorer",
@@ -28,12 +26,12 @@ st.markdown(
     <style>
       .stApp {
         background:
-          radial-gradient(circle at top left, rgba(59,130,246,0.10), transparent 28%),
-          radial-gradient(circle at top right, rgba(20,184,166,0.08), transparent 24%),
-          linear-gradient(180deg, #f8fbff 0%, #ffffff 32%, #f7f9fc 100%);
+          radial-gradient(circle at top left, rgba(37, 99, 235, 0.10), transparent 28%),
+          radial-gradient(circle at top right, rgba(20, 184, 166, 0.08), transparent 24%),
+          linear-gradient(180deg, #f8fbff 0%, #ffffff 34%, #f7f9fc 100%);
       }
       .hero {
-        padding: 1.3rem 1.3rem 1.1rem 1.3rem;
+        padding: 1.35rem 1.35rem 1.1rem 1.35rem;
         border-radius: 24px;
         background: linear-gradient(135deg, rgba(37, 99, 235, 0.13), rgba(14, 165, 233, 0.09), rgba(20, 184, 166, 0.07));
         border: 1px solid rgba(91, 120, 180, 0.16);
@@ -41,8 +39,8 @@ st.markdown(
       }
       .hero h1 { margin: 0 0 0.25rem 0; font-size: 2.35rem; line-height: 1.08; }
       .hero p { margin: 0; color: #4b5563; font-size: 1rem; max-width: 980px; }
-      .feature-card, .metric-card {
-        background: rgba(255,255,255,0.9);
+      .feature-card, .result-card {
+        background: rgba(255,255,255,0.94);
         border: 1px solid #e5e7eb;
         border-radius: 18px;
         padding: 1rem 1rem 0.9rem 1rem;
@@ -61,14 +59,6 @@ st.markdown(
         margin-right: 0.35rem;
         margin-bottom: 0.25rem;
       }
-      .result-card {
-        background: white;
-        border: 1px solid #e5e7eb;
-        border-radius: 18px;
-        padding: 1rem 1rem 0.95rem 1rem;
-        box-shadow: 0 10px 24px rgba(15, 23, 42, 0.05);
-        margin-bottom: 0.95rem;
-      }
       .result-title { font-size: 1.03rem; font-weight: 800; color: #0f172a; margin-bottom: 0.3rem; }
       .result-meta { color: #6b7280; font-size: 0.88rem; margin-bottom: 0.55rem; }
       .result-excerpt {
@@ -83,7 +73,8 @@ st.markdown(
       }
       .small-note { color: #6b7280; font-size: 0.88rem; }
       hr.soft { border: none; border-top: 1px solid #e5e7eb; margin: 0.75rem 0 1rem 0; }
-      div[data-baseweb="input"] input, div[data-baseweb="select"] > div { border-radius: 14px !important; }
+      div[data-baseweb="input"] input { border-radius: 14px !important; }
+      div[data-baseweb="select"] > div { border-radius: 14px !important; }
       .stDownloadButton button { border-radius: 14px !important; font-weight: 700; }
     </style>
     """,
@@ -106,7 +97,7 @@ class ParsedEmail:
 
 
 def reset_app() -> None:
-    for key in ["uploaded_name", "uploaded_bytes", "parsed_emails", "search_term", "search_results", "sort_order"]:
+    for key in ["uploaded_name", "uploaded_bytes", "parsed_emails", "search_term", "search_results", "sort_order", "upload_status"]:
         st.session_state.pop(key, None)
     st.rerun()
 
@@ -143,6 +134,7 @@ def extract_payload_text(msg: Message) -> str:
                 decoded = payload.decode(charset, errors="replace")
             except Exception:
                 continue
+
             if content_type == "text/plain":
                 parts.append(decoded)
             elif content_type == "text/html" and not parts:
@@ -161,6 +153,7 @@ def extract_payload_text(msg: Message) -> str:
         except Exception:
             raw = msg.get_payload()
             return clean_text(raw if isinstance(raw, str) else "")
+
     return clean_text("\n".join(parts))
 
 
@@ -168,7 +161,8 @@ def extract_between_separator_lines(text: str) -> str:
     lines = text.splitlines()
     dash_indexes = [i for i, line in enumerate(lines) if DASH_LINE_RE.match(line)]
     if len(dash_indexes) >= 2:
-        start, end = dash_indexes[0] + 1, dash_indexes[1]
+        start = dash_indexes[0] + 1
+        end = dash_indexes[1]
         block = "\n".join(lines[start:end]).strip()
         if block:
             return clean_text(block)
@@ -194,7 +188,9 @@ def parse_date(msg: Message) -> Optional[datetime]:
 
 
 def fmt_dt(dt: Optional[datetime]) -> str:
-    return dt.astimezone().strftime("%Y-%m-%d %H:%M") if dt else "Unknown date"
+    if not dt:
+        return "Unknown date"
+    return dt.astimezone().strftime("%Y-%m-%d %H:%M")
 
 
 def sort_key(item: ParsedEmail, newest_first: bool):
@@ -202,95 +198,45 @@ def sort_key(item: ParsedEmail, newest_first: bool):
     return -dt.timestamp() if newest_first else dt.timestamp()
 
 
-def parse_message(msg: Message, idx: int) -> ParsedEmail:
-    subject = str(msg.get("subject", "(No subject)"))
-    sender = str(msg.get("from", "(Unknown sender)"))
-    date_utc = parse_date(msg)
-    body = extract_payload_text(msg)
-    combined = clean_text(f"{subject}\n{body}")
-    matched_second_gts = second_gts_id(combined)
-    excerpt = extract_between_separator_lines(body)
-    return ParsedEmail(idx, subject, sender, date_utc, matched_second_gts, excerpt, body)
-
-
+@st.cache_data(show_spinner=False)
 def parse_mbox_bytes(uploaded_bytes: bytes, filename: str) -> list[ParsedEmail]:
-    """Parse either a raw mbox file, a zip containing an mbox file, or a mailbox package."""
     with tempfile.TemporaryDirectory() as tmpdir:
-        temp_dir = Path(tmpdir)
-        input_path = temp_dir / filename
-        input_path.write_bytes(uploaded_bytes)
+        temp_path = Path(tmpdir) / filename
+        temp_path.write_bytes(uploaded_bytes)
 
-        # If a zip file is uploaded, try to locate the actual mbox inside it.
-        candidate_path = input_path
-        if zipfile.is_zipfile(candidate_path):
-            extract_dir = temp_dir / "unzipped"
-            extract_dir.mkdir(exist_ok=True)
-            with zipfile.ZipFile(candidate_path, "r") as zf:
-                zf.extractall(extract_dir)
-            candidates = []
-            for root, _, files in os.walk(extract_dir):
-                for f in files:
-                    p = Path(root) / f
-                    name_lower = p.name.lower()
-                    if name_lower in {"mbox", "mailbox.mbox"} or name_lower.endswith(".mbox") or name_lower.endswith(".mbx"):
-                        candidates.append(p)
-            candidate_path = max(candidates, key=lambda p: p.stat().st_size, default=input_path)
-
-        # First try mailbox.mbox for plain mbox files.
+        mbox = mailbox.mbox(str(temp_path), factory=None, create=False)
         parsed: list[ParsedEmail] = []
-        try:
-            mbox = mailbox.mbox(str(candidate_path), factory=None, create=False)
-            try:
-                for idx, msg in enumerate(mbox):
-                    parsed.append(parse_message(msg, idx))
-            finally:
-                try:
-                    mbox.close()
-                except Exception:
-                    pass
-        except Exception:
-            parsed = []
 
-        # Fallback: parse the raw file manually if mailbox.mbox couldn't read anything.
-        if not parsed:
+        try:
+            for idx, msg in enumerate(mbox):
+                try:
+                    subject = str(msg.get("subject", "(No subject)"))
+                    sender = str(msg.get("from", "(Unknown sender)"))
+                    date_utc = parse_date(msg)
+                    body = extract_payload_text(msg)
+                    combined = clean_text(f"{subject}\n{body}")
+                    matched_second_gts = second_gts_id(combined)
+                    excerpt = extract_between_separator_lines(body)
+                    parsed.append(
+                        ParsedEmail(
+                            index=idx,
+                            subject=subject,
+                            sender=sender,
+                            date_utc=date_utc,
+                            second_gts_id=matched_second_gts,
+                            excerpt=excerpt,
+                            body=body,
+                        )
+                    )
+                except Exception:
+                    continue
+        finally:
             try:
-                raw_text = candidate_path.read_bytes().decode("utf-8", errors="replace")
-                # Split on mbox message boundaries.
-                blocks = re.split(r"(?m)^From .*$", raw_text)
-                # If split removed everything, use mailbox style parser fallback.
-                if len(blocks) <= 1:
-                    blocks = [raw_text]
-                idx = 0
-                for block in blocks:
-                    block = block.strip()
-                    if not block:
-                        continue
-                    msg = message_from_bytes(block.encode("utf-8", errors="ignore"))
-                    parsed.append(parse_message(msg, idx))
-                    idx += 1
+                mbox.close()
             except Exception:
                 pass
 
-        # Support Apple Mail exported .emlx folders zipped up.
-        if not parsed:
-            emlx_files = []
-            for root, _, files in os.walk(temp_dir):
-                for f in files:
-                    if f.endswith(".emlx"):
-                        emlx_files.append(Path(root) / f)
-            for idx, p in enumerate(sorted(emlx_files)):
-                try:
-                    content = p.read_text(encoding="utf-8", errors="replace")
-                    # Apple emlx begins with a line count; remove it if present.
-                    lines = content.splitlines()
-                    if lines and lines[0].strip().isdigit():
-                        content = "\n".join(lines[1:])
-                    msg = message_from_bytes(content.encode("utf-8", errors="ignore"))
-                    parsed.append(parse_message(msg, idx))
-                except Exception:
-                    continue
-
-        return parsed
+    return parsed
 
 
 def build_csv(rows: list[ParsedEmail], search_term: str) -> bytes:
@@ -327,6 +273,7 @@ st.session_state.setdefault("parsed_emails", [])
 st.session_state.setdefault("search_term", "")
 st.session_state.setdefault("search_results", [])
 st.session_state.setdefault("sort_order", "Oldest first")
+st.session_state.setdefault("upload_status", "")
 
 st.markdown(
     """
@@ -349,7 +296,7 @@ with st.sidebar:
         """
         <div class="feature-card">
           <div class="feature-title">What to upload</div>
-          <div class="muted">Use the Apple Mail export file called <b>mbox</b>, or upload a <b>ZIP</b> containing it.</div>
+          <div class="muted">Use the Apple Mail export file called <b>mbox</b>. The <b>table_of_contents</b> file is not needed.</div>
           <hr class="soft">
           <div class="feature-title">What to search</div>
           <div class="muted">Type only the digits, for example <b>260030</b>. The app matches the <b>second</b> GTS id.</div>
@@ -360,9 +307,11 @@ with st.sidebar:
         """,
         unsafe_allow_html=True,
     )
+
     st.markdown("### Controls")
     sort_order = st.radio("Sort order", ["Oldest first", "Newest first"], index=0 if st.session_state.sort_order == "Oldest first" else 1)
     st.session_state.sort_order = sort_order
+
     if st.button("🔄 Reset everything", use_container_width=True):
         reset_app()
     st.caption("Clears the upload, search term, and any results.")
@@ -372,9 +321,14 @@ left, right = st.columns([1.2, 0.8], gap="large")
 with left:
     uploaded = st.file_uploader(
         "Upload your exported mailbox",
-        type=["mbox", "mbx", "mailbox", "zip", "txt"],
-        help="Use the Apple Mail export file called 'mbox'. If needed, zip the export folder and upload the ZIP.",
+        type=None,
+        help="Choose the Apple Mail export file called 'mbox'. If you cannot select it, try zipping the file and uploading the ZIP.",
     )
+
+    if uploaded is not None:
+        st.success(f"File uploaded: {uploaded.name} ({uploaded.size:,} bytes)")
+        st.session_state.upload_status = f"{uploaded.name} • {uploaded.size:,} bytes"
+
     c1, c2 = st.columns([0.72, 0.28], gap="small")
     with c1:
         search_term = st.text_input(
@@ -385,6 +339,7 @@ with left:
         )
     with c2:
         do_search = st.button("🔎 Search", use_container_width=True)
+
     st.markdown('<hr class="soft">', unsafe_allow_html=True)
 
 with right:
@@ -412,6 +367,9 @@ if uploaded is not None:
             st.session_state.uploaded_bytes = uploaded.getvalue()
             st.session_state.parsed_emails = parse_mbox_bytes(uploaded.getvalue(), uploaded.name)
             st.session_state.search_results = []
+        st.success(f"Mailbox indexed: {len(st.session_state.parsed_emails)} messages ready.")
+    elif st.session_state.parsed_emails:
+        st.info(f"Mailbox already loaded: {len(st.session_state.parsed_emails)} messages indexed.")
 
 if do_search:
     st.session_state.search_term = re.sub(r"\D+", "", search_term.strip())
@@ -430,6 +388,7 @@ if do_search:
 if st.session_state.parsed_emails:
     total = len(st.session_state.parsed_emails)
     matched = len(st.session_state.search_results)
+
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("Messages indexed", f"{total}")
     m2.metric("Matches found", f"{matched}")
@@ -447,7 +406,6 @@ if st.session_state.parsed_emails:
             data=build_csv(st.session_state.search_results, st.session_state.search_term),
             file_name=f"wordbee_matches_{st.session_state.search_term}.csv",
             mime="text/csv",
-            use_container_width=False,
         )
         for item in st.session_state.search_results:
             render_result_card(item, st.session_state.search_term)
