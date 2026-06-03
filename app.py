@@ -59,6 +59,17 @@ st.markdown(
         margin-right: 0.35rem;
         margin-bottom: 0.25rem;
       }
+      .pill-green {
+        display: inline-block;
+        background: #dcfce7;
+        color: #166534;
+        padding: 0.28rem 0.58rem;
+        border-radius: 999px;
+        font-size: 0.81rem;
+        font-weight: 700;
+        margin-right: 0.35rem;
+        margin-bottom: 0.25rem;
+      }
       .result-title { font-size: 1.03rem; font-weight: 800; color: #0f172a; margin-bottom: 0.3rem; }
       .result-meta { color: #6b7280; font-size: 0.88rem; margin-bottom: 0.55rem; }
       .result-excerpt {
@@ -91,13 +102,22 @@ class ParsedEmail:
     subject: str
     sender: str
     date_utc: Optional[datetime]
-    second_gts_id: Optional[str]
+    match_id: Optional[str]
+    all_gts_ids: list[str]
     excerpt: str
     body: str
 
 
 def reset_app() -> None:
-    for key in ["uploaded_name", "uploaded_bytes", "parsed_emails", "search_term", "search_results", "sort_order", "upload_status"]:
+    for key in [
+        "uploaded_name",
+        "uploaded_bytes",
+        "parsed_emails",
+        "search_term",
+        "search_results",
+        "sort_order",
+        "upload_status",
+    ]:
         st.session_state.pop(key, None)
     st.rerun()
 
@@ -169,9 +189,16 @@ def extract_between_separator_lines(text: str) -> str:
     return clean_text(text)
 
 
-def second_gts_id(text: str) -> Optional[str]:
-    hits = GTS_RE.findall(text)
-    return hits[1] if len(hits) >= 2 else None
+def gts_ids_in_text(text: str) -> list[str]:
+    return GTS_RE.findall(text)
+
+
+def match_id_from_gts_ids(ids: list[str]) -> Optional[str]:
+    if len(ids) >= 2:
+        return ids[1]   # keep the second one for the two-GTS format
+    if len(ids) == 1:
+        return ids[0]   # support the single-GTS format
+    return None
 
 
 def parse_date(msg: Message) -> Optional[datetime]:
@@ -215,7 +242,8 @@ def parse_mbox_bytes(uploaded_bytes: bytes, filename: str) -> list[ParsedEmail]:
                     date_utc = parse_date(msg)
                     body = extract_payload_text(msg)
                     combined = clean_text(f"{subject}\n{body}")
-                    matched_second_gts = second_gts_id(combined)
+                    ids = gts_ids_in_text(combined)
+                    match_id = match_id_from_gts_ids(ids)
                     excerpt = extract_between_separator_lines(body)
                     parsed.append(
                         ParsedEmail(
@@ -223,7 +251,8 @@ def parse_mbox_bytes(uploaded_bytes: bytes, filename: str) -> list[ParsedEmail]:
                             subject=subject,
                             sender=sender,
                             date_utc=date_utc,
-                            second_gts_id=matched_second_gts,
+                            match_id=match_id,
+                            all_gts_ids=ids,
                             excerpt=excerpt,
                             body=body,
                         )
@@ -242,22 +271,31 @@ def parse_mbox_bytes(uploaded_bytes: bytes, filename: str) -> list[ParsedEmail]:
 def build_csv(rows: list[ParsedEmail], search_term: str) -> bytes:
     buf = io.StringIO()
     writer = csv.writer(buf)
-    writer.writerow(["search_term", "subject", "from", "date", "second_gts_id", "excerpt"])
+    writer.writerow(["search_term", "subject", "from", "date", "matched_gts_id", "all_gts_ids", "excerpt"])
     for r in rows:
-        writer.writerow([search_term, r.subject, r.sender, fmt_dt(r.date_utc), r.second_gts_id or "", r.excerpt])
+        writer.writerow([
+            search_term,
+            r.subject,
+            r.sender,
+            fmt_dt(r.date_utc),
+            r.match_id or "",
+            " | ".join(r.all_gts_ids),
+            r.excerpt,
+        ])
     return buf.getvalue().encode("utf-8")
 
 
 def render_result_card(item: ParsedEmail, search_term: str) -> None:
-    matched_id = f"GTS{item.second_gts_id}" if item.second_gts_id else "—"
+    matched_id = f"GTS{item.match_id}" if item.match_id else "—"
+    all_ids = ", ".join(f"GTS{x}" for x in item.all_gts_ids) if item.all_gts_ids else "—"
     st.markdown(
         f"""
         <div class="result-card">
           <div class="result-title">{html.escape(item.subject)}</div>
           <div class="result-meta">
             <span class="pill">Search ID: {html.escape(search_term)}</span>
-            <span class="pill">Matched: {html.escape(matched_id)}</span>
-            <span class="pill">Mail #{item.index + 1}</span>
+            <span class="pill-green">Matched: {html.escape(matched_id)}</span>
+            <span class="pill">Found in email: {html.escape(all_ids)}</span>
           </div>
           <div class="result-meta">From: {html.escape(item.sender)} • {html.escape(fmt_dt(item.date_utc))}</div>
           <div class="result-excerpt">{html.escape(item.excerpt or "(No readable body found)")}</div>
@@ -281,7 +319,7 @@ st.markdown(
       <h1>Wordbee Mail Explorer</h1>
       <p>
         Upload the Apple Mail <b>mbox</b> export for the <b>wordbee</b> folder, search by the <b>numeric job ID only</b>,
-        and review messages that match the <b>second GTS identifier</b> in chronological order.
+        and review messages that match the relevant GTS identifier in chronological order.
       </p>
     </div>
     """,
@@ -299,7 +337,7 @@ with st.sidebar:
           <div class="muted">Use the Apple Mail export file called <b>mbox</b>. The <b>table_of_contents</b> file is not needed.</div>
           <hr class="soft">
           <div class="feature-title">What to search</div>
-          <div class="muted">Type only the digits, for example <b>260030</b>. The app matches the <b>second</b> GTS id.</div>
+          <div class="muted">Type only the digits, for example <b>260030</b>. The app matches the <b>second GTS</b> when there are two, and the <b>single GTS</b> when there is only one.</div>
           <hr class="soft">
           <div class="feature-title">What you will see</div>
           <div class="muted">Results are shown oldest to newest by default, with only the text between the two dashed separator lines.</div>
@@ -309,7 +347,11 @@ with st.sidebar:
     )
 
     st.markdown("### Controls")
-    sort_order = st.radio("Sort order", ["Oldest first", "Newest first"], index=0 if st.session_state.sort_order == "Oldest first" else 1)
+    sort_order = st.radio(
+        "Sort order",
+        ["Oldest first", "Newest first"],
+        index=0 if st.session_state.sort_order == "Oldest first" else 1,
+    )
     st.session_state.sort_order = sort_order
 
     if st.button("🔄 Reset everything", use_container_width=True):
@@ -333,9 +375,9 @@ with left:
     with c1:
         search_term = st.text_input(
             "Search by numeric job ID",
-            placeholder="Example: 260030",
+            placeholder="Example: 250106 or 260030",
             value=st.session_state.search_term,
-            help="Do not include the word GTS. Use only the numeric part from the second GTS ID.",
+            help="Do not include the word GTS. Use only the numeric part.",
         )
     with c2:
         do_search = st.button("🔎 Search", use_container_width=True)
@@ -346,10 +388,10 @@ with right:
     st.markdown(
         """
         <div class="feature-card">
-          <div class="feature-title">Example match</div>
+          <div class="feature-title">Example matches</div>
           <div class="muted">
-            For a subject/body containing <b>GTS-217638-GTS260030</b>, search for <b>260030</b>.
-            The app ignores the first GTS ID and matches the second one.
+            For <b>GTS-217638-GTS260030</b>, search for <b>260030</b>.<br><br>
+            For <b>GTS250106</b> alone, search for <b>250106</b>.
           </div>
         </div>
         """,
@@ -379,7 +421,7 @@ if do_search:
         st.warning("Upload the mailbox file before searching.")
     else:
         term = st.session_state.search_term
-        st.session_state.search_results = [item for item in st.session_state.parsed_emails if item.second_gts_id == term]
+        st.session_state.search_results = [item for item in st.session_state.parsed_emails if item.match_id == term]
         st.session_state.search_results = sorted(
             st.session_state.search_results,
             key=lambda item: sort_key(item, st.session_state.sort_order == "Newest first"),
@@ -396,7 +438,7 @@ if st.session_state.parsed_emails:
     m4.metric("Sort order", st.session_state.sort_order)
 
     if st.session_state.search_term and not st.session_state.search_results and do_search:
-        st.info("No messages matched that second GTS ID.")
+        st.info("No messages matched that identifier.")
 
     if st.session_state.search_results:
         st.markdown(f"### Results for `{st.session_state.search_term}`")
@@ -411,7 +453,7 @@ if st.session_state.parsed_emails:
             render_result_card(item, st.session_state.search_term)
     elif st.session_state.search_term:
         st.markdown("### No matches yet")
-        st.caption("Try another numeric ID, or confirm the email contains the second GTS identifier.")
+        st.caption("Try another numeric ID, or confirm the email contains a supported GTS identifier.")
 else:
     st.info("Upload the exported mailbox file to begin.")
 
