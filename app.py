@@ -36,20 +36,21 @@ st.markdown(
           linear-gradient(180deg, #f8fbff 0%, #ffffff 34%, #f7f9fc 100%);
       }
       .hero {
-        padding: 1.15rem 1.25rem 1rem 1.25rem;
+        padding: 1.05rem 1.2rem 0.95rem 1.2rem;
         border-radius: 22px;
         background: linear-gradient(135deg, rgba(37,99,235,0.13), rgba(14,165,233,0.09), rgba(20,184,166,0.07));
         border: 1px solid rgba(91,120,180,0.16);
         box-shadow: 0 10px 30px rgba(15,23,42,0.06);
-        margin-bottom: 0.75rem;
+        margin-bottom: 0.65rem;
       }
-      .hero h1 { margin: 0; font-size: 2.2rem; line-height: 1.08; }
+      .hero h1 { margin: 0; font-size: 2.1rem; line-height: 1.08; }
       .result-card {
         background: rgba(255,255,255,0.96);
         border: 1px solid #e5e7eb;
         border-radius: 18px;
         padding: 1rem 1rem 0.9rem 1rem;
         box-shadow: 0 8px 24px rgba(15,23,42,0.05);
+        margin-bottom: 0.9rem;
       }
       .pill {
         display: inline-block;
@@ -88,7 +89,6 @@ st.markdown(
       .result-meta { color: #6b7280; font-size: 0.88rem; margin-bottom: 0.55rem; }
       .result-date-red { color: #b91c1c; font-weight: 800; }
       .result-body {
-        white-space: pre-wrap;
         line-height: 1.65;
         font-size: 0.98rem;
         color: #111827;
@@ -97,6 +97,7 @@ st.markdown(
         padding: 0.95rem;
         border-radius: 14px;
       }
+      .result-body p { margin: 0 0 0.9rem 0; }
       .result-body a {
         white-space: nowrap;
         display: inline-block;
@@ -134,17 +135,10 @@ class ParsedEmail:
     completed_flag: bool = False
 
 
-def reset_app() -> None:
-    for key in [
-        "uploaded_name",
-        "uploaded_bytes",
-        "parsed_emails",
-        "search_term",
-        "search_term_input",
-        "search_results",
-        "sort_order",
-    ]:
-        st.session_state.pop(key, None)
+def reset_search() -> None:
+    st.session_state.search_term_input = ""
+    st.session_state.search_term = ""
+    st.session_state.search_results = []
     st.rerun()
 
 
@@ -475,11 +469,9 @@ def build_csv(rows: list[ParsedEmail], search_term: str) -> bytes:
 
 def render_result_card(item: ParsedEmail, search_term: str, highlight_latest: bool) -> None:
     matched_id = f"GTS{item.display_id}" if item.display_id else "—"
-    all_ids = ", ".join(f"GTS{x}" for x in item.ids_in_order) if item.ids_in_order else "—"
-    completed_badge = '<span class="pill-red">Completed</span>' if item.completed_flag else ""
-    date_html = html.escape(fmt_dt(item.date_utc))
+    date_text = html.escape(fmt_dt(item.date_utc))
     if highlight_latest:
-        date_html = f'<span class="result-date-red">{date_html}</span>'
+        date_text = f'<span class="result-date-red">{date_text}</span>'
 
     st.markdown(
         f"""
@@ -488,19 +480,18 @@ def render_result_card(item: ParsedEmail, search_term: str, highlight_latest: bo
           <div class="result-meta">
             <span class="pill">Search ID: {html.escape(search_term)}</span>
             <span class="pill-green">Matched: {html.escape(matched_id)}</span>
-            {completed_badge}
-            <span class="pill">All IDs: {html.escape(all_ids)}</span>
+            {"<span class='pill-red'>Completed</span>" if item.completed_flag else ""}
           </div>
-          <div class="result-meta">From: {html.escape(item.sender)} • {date_html}</div>
-          <div class="result-body">{item.excerpt_markdown}</div>
+          <div class="result-meta">From: {html.escape(item.sender)} • {date_text}</div>
         </div>
         """,
         unsafe_allow_html=True,
     )
 
+    st.markdown(f"<div class='result-body'>{item.excerpt_markdown}</div>", unsafe_allow_html=True)
+
     with st.expander("Show match details", expanded=False):
         st.write(f"Matched reason: {item.match_reason or 'n/a'}")
-        st.write("Completed label:", "yes" if item.completed_flag else "no")
         st.write("Extracted IDs:", item.ids_in_order or ["(none)"])
         st.markdown(item.body_markdown or "(No readable body found)")
 
@@ -525,13 +516,12 @@ with st.sidebar:
         value=st.session_state.names_text,
         placeholder="Hiromi Weston\nJoseph Massaro\nEmmanuel Lizares",
         height=170,
-        label_visibility="visible",
     )
 
     st.markdown("### Controls")
     st.session_state.sort_order = st.radio("Sort order", ["Oldest first", "Newest first"], index=0 if st.session_state.sort_order == "Oldest first" else 1)
     if st.button("Clear Search", use_container_width=True):
-        reset_app()
+        reset_search()
 
 names_for_completed = [line.strip() for line in re.split(r"[\n,;]+", st.session_state.names_text or "") if line.strip()]
 
@@ -547,12 +537,7 @@ if uploaded is not None:
 search_col, button_col = st.columns([0.82, 0.18], gap="small")
 with search_col:
     st.markdown("### Search by numeric job ID")
-    st.text_input(
-        "",
-        key="search_term_input",
-        placeholder="Example: 250106 or 260030",
-        label_visibility="collapsed",
-    )
+    st.text_input("", key="search_term_input", placeholder="Example: 250106 or 260030", label_visibility="collapsed")
 with button_col:
     st.markdown("<div style='height: 2.1rem;'></div>", unsafe_allow_html=True)
     do_search = st.button("🔎 Search", use_container_width=True)
@@ -593,6 +578,7 @@ if do_search:
 if st.session_state.parsed_emails:
     total = len(st.session_state.parsed_emails)
     matched = len(st.session_state.search_results)
+
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("Messages indexed", f"{total}")
     m2.metric("Matches found", f"{matched}")
