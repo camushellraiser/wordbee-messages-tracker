@@ -13,9 +13,10 @@ from email.message import Message
 from email.parser import BytesParser
 from email.utils import parsedate_to_datetime
 from pathlib import Path
-from typing import Optional, Iterable
+from typing import Optional
 
 import streamlit as st
+from bs4 import BeautifulSoup, NavigableString, Tag
 
 
 st.set_page_config(
@@ -44,7 +45,7 @@ st.markdown(
       .hero h1 { margin: 0 0 0.25rem 0; font-size: 2.35rem; line-height: 1.08; }
       .hero p { margin: 0; color: #4b5563; font-size: 1rem; max-width: 980px; }
       .feature-card, .result-card {
-        background: rgba(255,255,255,0.94);
+        background: rgba(255,255,255,0.96);
         border: 1px solid #e5e7eb;
         border-radius: 18px;
         padding: 1rem 1rem 0.9rem 1rem;
@@ -76,14 +77,14 @@ st.markdown(
       }
       .result-title { font-size: 1.03rem; font-weight: 800; color: #0f172a; margin-bottom: 0.3rem; }
       .result-meta { color: #6b7280; font-size: 0.88rem; margin-bottom: 0.55rem; }
-      .result-excerpt {
+      .result-body {
         white-space: pre-wrap;
-        line-height: 1.55;
-        font-size: 0.97rem;
+        line-height: 1.65;
+        font-size: 0.98rem;
         color: #111827;
         background: #f8fafc;
         border: 1px solid #edf2f7;
-        padding: 0.9rem;
+        padding: 0.95rem;
         border-radius: 14px;
       }
       .small-note { color: #6b7280; font-size: 0.88rem; }
@@ -91,20 +92,20 @@ st.markdown(
       div[data-baseweb="input"] input { border-radius: 14px !important; }
       div[data-baseweb="select"] > div { border-radius: 14px !important; }
       .stDownloadButton button { border-radius: 14px !important; font-weight: 700; }
+      a { text-decoration: none; }
     </style>
     """,
     unsafe_allow_html=True,
 )
 
-# We support the common Wordbee patterns:
+# Match both styles and messy variants:
 # - GTS260030_Web...
 # - GTS-217638-GTS260030_Web...
-# - GTS250106...
-# - GTS 250106 ...
-# and we intentionally keep this forgiving.
-GTS_RE = re.compile(r"(?i)\bGTS(?:[-_\s]*)(\d+)")
+# - GTS250106
+# - GTS 250106
+# Keep it forgiving.
+GTS_RE = re.compile(r"(?i)GTS(?:[-_\s]*)(\d+)")
 DASH_LINE_RE = re.compile(r"^\s*-{8,}\s*$")
-NUM_RE = re.compile(r"\d+")
 
 
 @dataclass
@@ -115,8 +116,8 @@ class ParsedEmail:
     date_utc: Optional[datetime]
     ids_in_order: list[str]
     display_id: Optional[str]
-    excerpt: str
-    body: str
+    excerpt_markdown: str
+    body_markdown: str
     combined_text: str
     match_reason: str = ""
 
@@ -129,7 +130,6 @@ def reset_app() -> None:
         "search_term",
         "search_results",
         "sort_order",
-        "upload_status",
     ]:
         st.session_state.pop(key, None)
     st.rerun()
@@ -142,7 +142,7 @@ def clean_text(text: str) -> str:
     return text.strip()
 
 
-def html_to_text(text: str) -> str:
+def html_to_plain(text: str) -> str:
     text = html.unescape(text)
     text = re.sub(r"(?is)<(script|style).*?>.*?(</\1>)", " ", text)
     text = re.sub(r"(?s)<[^>]*>", " ", text)
@@ -166,11 +166,13 @@ def decode_payload(part: Message) -> str:
             return ""
 
 
-def extract_payload_text(msg: Message) -> str:
+def get_best_body(msg: Message) -> tuple[str, str]:
     """
-    Return the best available message text. We try plain text first, then HTML.
+    Return (html_body, plain_body). Prefer html when present.
     """
-    parts: list[str] = []
+    html_body = ""
+    plain_body = ""
+
     if msg.is_multipart():
         for part in msg.walk():
             if part.get_content_maintype() == "multipart":
@@ -183,43 +185,131 @@ def extract_payload_text(msg: Message) -> str:
             if not decoded:
                 continue
 
-            if content_type == "text/plain":
-                parts.append(decoded)
-            elif content_type == "text/html" and not parts:
-                parts.append(html_to_text(decoded))
+            if content_type == "text/html" and not html_body:
+                html_body = decoded
+            elif content_type == "text/plain" and not plain_body:
+                plain_body = decoded
     else:
+        content_type = (msg.get_content_type() or "").lower()
         decoded = decode_payload(msg)
-        if not decoded:
-            return ""
-        if (msg.get_content_type() or "").lower() == "text/html":
-            decoded = html_to_text(decoded)
-        return clean_text(decoded)
+        if content_type == "text/html":
+            html_body = decoded
+        else:
+            plain_body = decoded
 
-    return clean_text("\n".join(parts))
+    return html_body.strip(), plain_body.strip()
 
 
-def extract_between_separator_lines(text: str) -> str:
-    lines = text.splitlines()
-    dash_indexes = [i for i, line in enumerate(lines) if DASH_LINE_RE.match(line)]
+def normalize_separator_text(text: str) -> str:
+    return re.sub(r"\s+", "", text or "")
+
+
+def is_separator_text(text: str) -> bool:
+    return bool(DASH_LINE_RE.match((text or "").strip()))
+
+
+def node_to_markdown(node) -> str:
+    if isinstance(node, NavigableString):
+        return str(node)
+
+    if not isinstance(node, Tag):
+        return ""
+
+    name = (node.name or "").lower()
+
+    if name == "br":
+        return "\n"
+
+    if name == "a":
+        label = "".join(node_to_markdown(child) for child in node.children).strip()
+        href = (node.get("href") or "").strip()
+        if href and label:
+            return f"[{label}]({href})"
+        if href and not label:
+            return href
+        return label
+
+    if name in {"p", "div", "li", "tr", "section", "article", "blockquote"}:
+        chunks = []
+        for child in node.children:
+            chunks.append(node_to_markdown(child))
+        text = "".join(chunks)
+        text = html_to_plain(text) if name in {"tr"} else text
+        if name == "li":
+            text = "- " + clean_text(text)
+            return text + "\n"
+        return clean_text(text) + "\n\n"
+
+    if name in {"strong", "b"}:
+        inner = "".join(node_to_markdown(child) for child in node.children).strip()
+        return f"**{inner}**" if inner else ""
+
+    if name in {"em", "i"}:
+        inner = "".join(node_to_markdown(child) for child in node.children).strip()
+        return f"*{inner}*" if inner else ""
+
+    if name in {"span", "font", "u"}:
+        return "".join(node_to_markdown(child) for child in node.children)
+
+    if name in {"ul", "ol"}:
+        items = []
+        for child in node.children:
+            if isinstance(child, Tag) and child.name and child.name.lower() == "li":
+                items.append(node_to_markdown(child).rstrip())
+        return "\n".join(items) + ("\n\n" if items else "")
+
+    return "".join(node_to_markdown(child) for child in node.children)
+
+
+def html_fragment_to_markdown(fragment_html: str) -> str:
+    if not fragment_html.strip():
+        return ""
+    soup = BeautifulSoup(fragment_html, "html.parser")
+    chunks = []
+    for child in soup.contents:
+        chunks.append(node_to_markdown(child))
+    text = "".join(chunks)
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    # Preserve line breaks and keep the output tidy
+    text = re.sub(r"[ \t]+\n", "\n", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def extract_html_between_separators(html_body: str) -> str:
+    soup = BeautifulSoup(html_body, "html.parser")
+    tags = soup.find_all(True)
+    sep_tags = []
+    for tag in tags:
+        if is_separator_text(tag.get_text(" ", strip=True)):
+            sep_tags.append(tag)
+    if len(sep_tags) >= 2:
+        first = sep_tags[0]
+        second = sep_tags[1]
+        fragments = []
+        for sib in first.next_siblings:
+            if sib == second:
+                break
+            if isinstance(sib, str) and not sib.strip():
+                continue
+            fragments.append(str(sib))
+        return html_fragment_to_markdown("".join(fragments))
+
+    return html_fragment_to_markdown(html_body)
+
+
+def extract_plain_between_separators(plain_body: str) -> str:
+    lines = plain_body.replace("\r\n", "\n").replace("\r", "\n").splitlines()
+    dash_indexes = [i for i, line in enumerate(lines) if is_separator_text(line)]
     if len(dash_indexes) >= 2:
         start = dash_indexes[0] + 1
         end = dash_indexes[1]
-        block = "\n".join(lines[start:end]).strip()
-        if block:
-            return clean_text(block)
-    return clean_text(text)
+        return clean_text("\n".join(lines[start:end]))
+    return clean_text(plain_body)
 
 
 def extract_ids(text: str) -> list[str]:
-    """
-    Flexible ID extraction:
-    - matches GTS260030
-    - matches GTS-217638
-    - matches GTS 250106
-    - tolerates HTML-cleaned or lightly split formatting
-    """
-    ids = GTS_RE.findall(text)
-    # Deduplicate while preserving order
+    ids = GTS_RE.findall(text or "")
     seen = set()
     ordered = []
     for i in ids:
@@ -230,11 +320,6 @@ def extract_ids(text: str) -> list[str]:
 
 
 def extract_display_id(ids: list[str]) -> Optional[str]:
-    """
-    For the two-ID format, prefer the second ID.
-    For the one-ID format, use that single ID.
-    If no IDs are extracted, return None.
-    """
     if len(ids) >= 2:
         return ids[1]
     if len(ids) == 1:
@@ -266,8 +351,38 @@ def sort_key(item: ParsedEmail, newest_first: bool):
     return -dt.timestamp() if newest_first else dt.timestamp()
 
 
-def try_message_from_bytes(data: bytes) -> Message:
-    return BytesParser(policy=policy.default).parsebytes(data)
+def parse_message(idx: int, msg: Message) -> ParsedEmail:
+    subject = str(msg.get("subject", "(No subject)"))
+    sender = str(msg.get("from", "(Unknown sender)"))
+    date_utc = parse_date(msg)
+    html_body, plain_body = get_best_body(msg)
+
+    if html_body:
+        body_markdown = extract_html_between_separators(html_body)
+    else:
+        body_markdown = extract_plain_between_separators(plain_body)
+
+    # For searching, use both the visible markdown and the full raw text.
+    combined = clean_text(
+        f"{subject}\n"
+        f"{html_to_plain(html_body) if html_body else plain_body}\n"
+        f"{body_markdown}"
+    )
+
+    ids = extract_ids(combined)
+    display_id = extract_display_id(ids)
+
+    return ParsedEmail(
+        index=idx,
+        subject=subject,
+        sender=sender,
+        date_utc=date_utc,
+        ids_in_order=ids,
+        display_id=display_id,
+        excerpt_markdown=body_markdown,
+        body_markdown=body_markdown,
+        combined_text=combined,
+    )
 
 
 def parse_mbox_file(path: Path) -> list[ParsedEmail]:
@@ -275,7 +390,10 @@ def parse_mbox_file(path: Path) -> list[ParsedEmail]:
     mbox = mailbox.mbox(str(path), factory=None, create=False)
     try:
         for idx, msg in enumerate(mbox):
-            parsed.append(parse_message(idx, msg))
+            try:
+                parsed.append(parse_message(idx, msg))
+            except Exception:
+                continue
     finally:
         try:
             mbox.close()
@@ -286,42 +404,11 @@ def parse_mbox_file(path: Path) -> list[ParsedEmail]:
 
 def parse_eml_file(path: Path) -> ParsedEmail:
     data = path.read_bytes()
-    msg = try_message_from_bytes(data)
+    msg = BytesParser(policy=policy.default).parsebytes(data)
     return parse_message(0, msg)
 
 
-def parse_message(idx: int, msg: Message) -> ParsedEmail:
-    subject = str(msg.get("subject", "(No subject)"))
-    sender = str(msg.get("from", "(Unknown sender)"))
-    date_utc = parse_date(msg)
-
-    body = extract_payload_text(msg)
-    combined = clean_text(f"{subject}\n{body}")
-
-    ids = extract_ids(combined)
-    display_id = extract_display_id(ids)
-    excerpt = extract_between_separator_lines(body)
-
-    return ParsedEmail(
-        index=idx,
-        subject=subject,
-        sender=sender,
-        date_utc=date_utc,
-        ids_in_order=ids,
-        display_id=display_id,
-        excerpt=excerpt,
-        body=body,
-        combined_text=combined,
-    )
-
-
 def parse_uploaded_file(uploaded_bytes: bytes, filename: str) -> list[ParsedEmail]:
-    """
-    Supports:
-    - direct mbox file
-    - zip archive containing an mbox file or .eml files
-    - direct .eml file
-    """
     name = filename.lower()
 
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -329,60 +416,44 @@ def parse_uploaded_file(uploaded_bytes: bytes, filename: str) -> list[ParsedEmai
         raw_path = tmp / filename
         raw_path.write_bytes(uploaded_bytes)
 
-        # ZIP containing mbox or eml files
         if zipfile.is_zipfile(raw_path) or name.endswith(".zip"):
             extracted = tmp / "unzipped"
             extracted.mkdir(exist_ok=True)
             with zipfile.ZipFile(raw_path, "r") as zf:
                 zf.extractall(extracted)
 
-            # Try to find an mbox first
             for candidate in extracted.rglob("*"):
                 if candidate.is_file() and candidate.name.lower() == "mbox":
                     return parse_mbox_file(candidate)
-            # Or any .mbox
+
             for candidate in extracted.rglob("*.mbox"):
                 if candidate.is_file():
                     return parse_mbox_file(candidate)
-            # Or parse individual .eml files
+
             emls = [p for p in extracted.rglob("*") if p.is_file() and p.suffix.lower() in {".eml", ".emlx"}]
             if emls:
                 return [parse_eml_file(p) for p in sorted(emls)]
-            # Fall through and try raw as mbox
-        # Direct EML
+
         elif name.endswith(".eml") or name.endswith(".emlx"):
             return [parse_eml_file(raw_path)]
 
-        # Default: assume mbox even if no extension
         return parse_mbox_file(raw_path)
 
 
 def match_message(item: ParsedEmail, term: str) -> tuple[bool, str]:
-    """
-    Search logic:
-    1) Exact match against extracted IDs.
-    2) Exact number within any GTS-like token in subject/body.
-    3) A forgiving raw-text fallback around GTS.
-    """
     if not term:
         return False, ""
 
-    # Straight ID match if we extracted it.
     if term in item.ids_in_order:
-        if len(item.ids_in_order) >= 2 and item.display_id == term:
-            return True, "matched extracted display ID"
-        if len(item.ids_in_order) == 1 and item.display_id == term:
-            return True, "matched single extracted ID"
         return True, "matched extracted ID"
 
-    # Search the raw combined text for a GTS token containing the target number.
     raw = item.combined_text
 
-    # Matches things like GTS260030_Web..., GTS-217638-GTS260030..., GTS 250106 ...
+    # Exact number near GTS in the raw body or subject
     if re.search(rf"(?is)GTS(?:[-_\s]*\d+)?[-_\s]*{re.escape(term)}(?!\d)", raw):
         return True, "matched flexible GTS token in raw text"
 
-    # If the number appears near GTS but tokenization is messy, still treat as match.
+    # Raw proximity fallback if the token is split by punctuation or whitespace
     if re.search(rf"(?is)GTS.{0,80}?{re.escape(term)}|{re.escape(term)}.{0,80}?GTS", raw):
         return True, "matched raw-text proximity to GTS"
 
@@ -402,7 +473,7 @@ def build_csv(rows: list[ParsedEmail], search_term: str) -> bytes:
             r.display_id or "",
             " | ".join(r.ids_in_order),
             r.match_reason,
-            r.excerpt,
+            r.excerpt_markdown,
         ])
     return buf.getvalue().encode("utf-8")
 
@@ -421,7 +492,7 @@ def render_result_card(item: ParsedEmail, search_term: str) -> None:
             <span class="pill">All IDs: {html.escape(all_ids)}</span>
           </div>
           <div class="result-meta">From: {html.escape(item.sender)} • {html.escape(fmt_dt(item.date_utc))}</div>
-          <div class="result-excerpt">{html.escape(item.excerpt or "(No readable body found)")}</div>
+          <div class="result-body">{item.excerpt_markdown}</div>
         </div>
         """,
         unsafe_allow_html=True,
@@ -430,10 +501,9 @@ def render_result_card(item: ParsedEmail, search_term: str) -> None:
     with st.expander("Show match details", expanded=False):
         st.write(f"Matched reason: {item.match_reason or 'n/a'}")
         st.write("Extracted IDs:", item.ids_in_order or ["(none)"])
-        st.text(item.body or "(No readable body found)")
+        st.markdown(item.body_markdown or "(No readable body found)")
 
 
-# Session defaults
 st.session_state.setdefault("parsed_emails", [])
 st.session_state.setdefault("search_term", "")
 st.session_state.setdefault("search_results", [])
@@ -463,10 +533,10 @@ with st.sidebar:
           <div class="muted">Use the Apple Mail export file called <b>mbox</b>. The <b>table_of_contents</b> file is not needed. ZIP files are also supported.</div>
           <hr class="soft">
           <div class="feature-title">What to search</div>
-          <div class="muted">Type only the digits, for example <b>260030</b> or <b>250106</b>. The app uses the best available GTS match, including messy real-world formatting.</div>
+          <div class="muted">Type only the digits, for example <b>260030</b> or <b>250106</b>. The app uses flexible matching for the real-world Wordbee format.</div>
           <hr class="soft">
           <div class="feature-title">What you will see</div>
-          <div class="muted">Results are shown oldest to newest by default, with only the text between the two dashed separator lines.</div>
+          <div class="muted">Results are shown oldest to newest by default, with only the text between the dashed separator lines. Links are preserved.</div>
         </div>
         """,
         unsafe_allow_html=True,
@@ -577,7 +647,7 @@ if st.session_state.parsed_emails:
 
     if st.session_state.search_results:
         st.markdown(f"### Results for `{st.session_state.search_term}`")
-        st.caption("Displayed in the order you selected. Each card shows the content between the dashed separator lines.")
+        st.caption("Displayed in the order you selected. Each card shows only the content between the dashed separator lines.")
         st.download_button(
             "⬇️ Download CSV",
             data=build_csv(st.session_state.search_results, st.session_state.search_term),

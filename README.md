@@ -8,9 +8,10 @@ A polished Streamlit app for searching Apple Mail **mbox** exports from the `wor
 - Match IDs in both message styles:
   - one GTS identifier
   - two GTS identifiers, where the second is the key one
-- Also handle messy real-world formatting like `GTS260030_Web...`
+- Handle realistic Wordbee formatting like `GTS260030_Web...`
+- Extract only the content between the separator lines
+- Preserve the `Click to access job online` link when present
 - Show results in chronological order
-- Display only the text between the two dashed separator lines
 - Download matched results as CSV
 - Reset everything with one click
 
