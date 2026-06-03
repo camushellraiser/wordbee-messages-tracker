@@ -45,6 +45,16 @@ st.markdown(
         font-size: 2rem;
         line-height: 1.1;
       }
+      .card-title {
+        font-size: 1.02rem;
+        font-weight: 800;
+        color: #0f172a;
+        margin-bottom: 0.25rem;
+      }
+      .muted {
+        color: #6b7280;
+        font-size: 0.92rem;
+      }
       .msg-box {
         border: 1px solid #e5e7eb;
         border-radius: 16px;
@@ -68,44 +78,6 @@ st.markdown(
         overflow-wrap: normal;
         word-break: normal;
       }
-      .topline { margin-bottom: 0.2rem; }
-      .title { font-size: 1.02rem; font-weight: 800; color: #0f172a; margin-bottom: 0.3rem; }
-      .meta { color: #6b7280; font-size: 0.88rem; margin-bottom: 0.4rem; }
-      .pill {
-        display: inline-block;
-        background: #e0f2fe;
-        color: #075985;
-        padding: 0.28rem 0.58rem;
-        border-radius: 999px;
-        font-size: 0.81rem;
-        font-weight: 700;
-        margin-right: 0.35rem;
-        margin-bottom: 0.25rem;
-      }
-      .pill-green {
-        display: inline-block;
-        background: #dcfce7;
-        color: #166534;
-        padding: 0.28rem 0.58rem;
-        border-radius: 999px;
-        font-size: 0.81rem;
-        font-weight: 700;
-        margin-right: 0.35rem;
-        margin-bottom: 0.25rem;
-      }
-      .pill-red {
-        display: inline-block;
-        background: #fee2e2;
-        color: #991b1b;
-        padding: 0.28rem 0.58rem;
-        border-radius: 999px;
-        font-size: 0.81rem;
-        font-weight: 800;
-        margin-right: 0.35rem;
-        margin-bottom: 0.25rem;
-      }
-      .date-red { color: #b91c1c; font-weight: 800; }
-      .date-muted { color: #6b7280; }
       div[data-baseweb="input"] input { border-radius: 14px !important; }
       div[data-baseweb="textarea"] textarea { border-radius: 14px !important; }
       .stDownloadButton button { border-radius: 14px !important; font-weight: 700; }
@@ -124,9 +96,6 @@ class ParsedEmail:
     index: int
     subject: str
     sender: str
-    to: str
-    cc: str
-    reply_to: str
     date_utc: Optional[datetime]
     ids_in_order: list[str]
     display_id: Optional[str]
@@ -350,9 +319,6 @@ def sort_key(item: ParsedEmail, newest_first: bool):
 def parse_message(idx: int, msg: Message) -> ParsedEmail:
     subject = str(msg.get("subject", "(No subject)"))
     sender = str(msg.get("from", "(Unknown sender)"))
-    to = str(msg.get("to", ""))
-    cc = str(msg.get("cc", ""))
-    reply_to = str(msg.get("reply-to", ""))
     date_utc = parse_date(msg)
     html_body, plain_body = get_best_body(msg)
 
@@ -371,9 +337,6 @@ def parse_message(idx: int, msg: Message) -> ParsedEmail:
         index=idx,
         subject=subject,
         sender=sender,
-        to=to,
-        cc=cc,
-        reply_to=reply_to,
         date_utc=date_utc,
         ids_in_order=ids,
         display_id=display_id,
@@ -434,16 +397,13 @@ def parse_uploaded_file(uploaded_bytes: bytes, filename: str) -> list[ParsedEmai
 
 
 def completion_search_text(item: ParsedEmail) -> str:
-    # Search across headers + body.
+    # Search across the full message headers + body, not just the body.
     return "\n".join([item.subject, item.sender, item.to, item.cc, item.reply_to, item.full_text])
 
 
 def should_mark_completed(item: ParsedEmail, names: list[str]) -> bool:
-    if not names:
-        return False
-    if not COMPLETED_RE.search(completion_search_text(item)):
-        return False
-    return contains_any_person(completion_search_text(item), names)
+    haystack = completion_search_text(item)
+    return bool(names) and bool(COMPLETED_RE.search(haystack)) and contains_any_person(haystack, names)
 
 
 def match_message(item: ParsedEmail, term: str, names_for_completed: list[str]) -> tuple[bool, str, bool]:
@@ -466,15 +426,12 @@ def match_message(item: ParsedEmail, term: str, names_for_completed: list[str]) 
 def build_csv(rows: list[ParsedEmail], search_term: str) -> bytes:
     buf = io.StringIO()
     writer = csv.writer(buf)
-    writer.writerow(["search_term", "subject", "from", "to", "cc", "reply_to", "date", "matched_id", "match_reason", "completed_flag", "excerpt"])
+    writer.writerow(["search_term", "subject", "from", "date", "matched_id", "match_reason", "completed_flag", "excerpt"])
     for r in rows:
         writer.writerow([
             search_term,
             r.subject,
             r.sender,
-            r.to,
-            r.cc,
-            r.reply_to,
             fmt_dt(r.date_utc),
             r.display_id or "",
             r.match_reason,
@@ -487,30 +444,19 @@ def build_csv(rows: list[ParsedEmail], search_term: str) -> bytes:
 def render_result_card(item: ParsedEmail, search_term: str, highlight_latest: bool, latest_stale: bool) -> None:
     matched_id = f"GTS{item.display_id}" if item.display_id else "—"
     date_text = fmt_dt(item.date_utc)
-    date_class = "date-muted"
-    action_badge = ""
     if highlight_latest and latest_stale:
-        date_class = "date-red"
-        action_badge = " <span class='pill-red'>Action Required</span>"
+        date_text = f":red[{date_text}]"
 
-    st.markdown(
-        f"""
-        <div class="msg-box">
-          <div class="title">{html.escape(item.subject)}</div>
-          <div class="meta">
-            <span class="pill">Search ID: {html.escape(search_term)}</span>
-            <span class="pill-green">Matched: {html.escape(matched_id)}</span>
-            {"<span class='pill-red'>Completed</span>" if item.completed_flag else ""}
-            {action_badge}
-          </div>
-          <div class="meta">From: {html.escape(item.sender)} • <span class="{date_class}">{html.escape(date_text)}</span></div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+    st.markdown(f"**{html.escape(item.subject)}**")
+    badge_line = f":blue[Search ID: {search_term}] :green[Matched: {matched_id}]"
+    if item.completed_flag:
+        badge_line += " :red[Completed]"
+    if highlight_latest and latest_stale:
+        badge_line += " :red[Action Required]"
+    st.markdown(badge_line)
+    st.caption(f"From: {item.sender} • {date_text}")
 
-    body_md = item.body_markdown.strip() or "(No readable body found)"
-    st.markdown(f"<div class='msg-box'><div class='msg-body'>{body_md}</div></div>", unsafe_allow_html=True)
+    st.markdown(f"<div class='msg-box'><div class='msg-body'>{item.body_markdown}</div></div>", unsafe_allow_html=True)
 
     with st.expander("Show match details", expanded=False):
         st.write(f"Matched reason: {item.match_reason or 'n/a'}")
@@ -609,9 +555,13 @@ if st.session_state.parsed_emails:
         st.markdown(f"### Results for `{st.session_state.search_term}`")
         st.caption("Displayed in the order you selected. Each card shows only the content between the dashed separator lines.")
 
-        latest_dt = max((item.date_utc for item in st.session_state.search_results if item.date_utc), default=None)
+        latest_dt = None
+        for item in st.session_state.search_results:
+            if item.date_utc and (latest_dt is None or item.date_utc > latest_dt):
+                latest_dt = item.date_utc
+
         now_utc = datetime.now(timezone.utc)
-        latest_stale = bool(latest_dt and (now_utc - latest_dt) > timedelta(days=2))
+        latest_is_stale = bool(latest_dt and (now_utc - latest_dt) > timedelta(days=2))
 
         st.download_button(
             "⬇️ Download CSV",
@@ -620,12 +570,7 @@ if st.session_state.parsed_emails:
             mime="text/csv",
         )
         for item in st.session_state.search_results:
-            render_result_card(
-                item,
-                st.session_state.search_term,
-                highlight_latest=(item.date_utc == latest_dt),
-                latest_stale=latest_stale,
-            )
+            render_result_card(item, st.session_state.search_term, highlight_latest=(item.date_utc == latest_dt), latest_stale=latest_is_stale)
     elif st.session_state.search_term:
         st.markdown("### No matches yet")
         st.caption("Try another numeric ID, or confirm the email contains a supported GTS identifier.")

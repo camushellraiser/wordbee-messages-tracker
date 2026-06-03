@@ -9,6 +9,6 @@ A polished Streamlit app for searching Apple Mail **mbox** exports from the `wor
 - Extract only the content between the dashed separator lines
 - Preserve links like `Click to access details online`
 - Add a red **Completed** badge only when the message contains one of the names you paste into the app and a completion phrase
-- Color the **latest** result's date red when it is older than 2 days
+- Color the **latest** result's date red when it is older than 2 days and not completed
 - Download matched results as CSV
 - Clear Search with one click
