@@ -485,7 +485,6 @@ def render_result_card(item: ParsedEmail, search_term: str, highlight_latest: bo
         unsafe_allow_html=True,
     )
 
-    # Render email body separately so no HTML from the card leaks into the message.
     st.markdown(f"<div class='result-body'>{item.body_markdown}</div>", unsafe_allow_html=True)
 
     with st.expander("Show match details", expanded=False):
@@ -573,10 +572,7 @@ if do_search:
                 item.match_reason = reason
                 item.completed_flag = completed_flag
                 results.append(item)
-        st.session_state.search_results = sorted(
-            results,
-            key=lambda item: sort_key(item, st.session_state.sort_order == "Newest first")
-        )
+        st.session_state.search_results = sorted(results, key=lambda item: sort_key(item, st.session_state.sort_order == "Newest first"))
 
 if st.session_state.parsed_emails:
     total = len(st.session_state.parsed_emails)
@@ -601,7 +597,7 @@ if st.session_state.parsed_emails:
                 latest_dt = item.date_utc
 
         now_utc = datetime.now(timezone.utc)
-        latest_is_stale = bool(latest_dt and (now_utc - latest_dt) > timedelta(days=2))
+        latest_is_stale = bool(latest_dt and (now_utc - latest_dt) > timedelta(days=2) and not any(r.completed_flag for r in st.session_state.search_results if r.date_utc == latest_dt))
 
         st.download_button(
             "⬇️ Download CSV",
