@@ -1,13 +1,13 @@
+
 import csv
 import html
 import io
 import mailbox
-import os
 import re
 import tempfile
 import zipfile
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from email import policy
 from email.message import Message
 from email.parser import BytesParser
@@ -20,7 +20,7 @@ from bs4 import BeautifulSoup, NavigableString, Tag
 
 
 st.set_page_config(
-    page_title="Wordbee Mail Explorer",
+    page_title="Wordbee Message Tracker",
     page_icon="📨",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -31,28 +31,26 @@ st.markdown(
     <style>
       .stApp {
         background:
-          radial-gradient(circle at top left, rgba(37, 99, 235, 0.10), transparent 28%),
-          radial-gradient(circle at top right, rgba(20, 184, 166, 0.08), transparent 24%),
+          radial-gradient(circle at top left, rgba(37,99,235,0.10), transparent 28%),
+          radial-gradient(circle at top right, rgba(20,184,166,0.08), transparent 24%),
           linear-gradient(180deg, #f8fbff 0%, #ffffff 34%, #f7f9fc 100%);
       }
       .hero {
-        padding: 1.35rem 1.35rem 1.1rem 1.35rem;
-        border-radius: 24px;
-        background: linear-gradient(135deg, rgba(37, 99, 235, 0.13), rgba(14, 165, 233, 0.09), rgba(20, 184, 166, 0.07));
-        border: 1px solid rgba(91, 120, 180, 0.16);
-        box-shadow: 0 10px 30px rgba(15, 23, 42, 0.06);
+        padding: 1.15rem 1.25rem 1rem 1.25rem;
+        border-radius: 22px;
+        background: linear-gradient(135deg, rgba(37,99,235,0.13), rgba(14,165,233,0.09), rgba(20,184,166,0.07));
+        border: 1px solid rgba(91,120,180,0.16);
+        box-shadow: 0 10px 30px rgba(15,23,42,0.06);
+        margin-bottom: 0.75rem;
       }
-      .hero h1 { margin: 0 0 0.25rem 0; font-size: 2.35rem; line-height: 1.08; }
-      .hero p { margin: 0; color: #4b5563; font-size: 1rem; max-width: 980px; }
-      .feature-card, .result-card {
+      .hero h1 { margin: 0; font-size: 2.2rem; line-height: 1.08; }
+      .result-card {
         background: rgba(255,255,255,0.96);
         border: 1px solid #e5e7eb;
         border-radius: 18px;
         padding: 1rem 1rem 0.9rem 1rem;
-        box-shadow: 0 8px 24px rgba(15, 23, 42, 0.05);
+        box-shadow: 0 8px 24px rgba(15,23,42,0.05);
       }
-      .feature-title { font-size: 1rem; font-weight: 800; margin-bottom: 0.35rem; }
-      .muted { color: #6b7280; font-size: 0.93rem; }
       .pill {
         display: inline-block;
         background: #e0f2fe;
@@ -75,8 +73,20 @@ st.markdown(
         margin-right: 0.35rem;
         margin-bottom: 0.25rem;
       }
+      .pill-red {
+        display: inline-block;
+        background: #fee2e2;
+        color: #991b1b;
+        padding: 0.28rem 0.58rem;
+        border-radius: 999px;
+        font-size: 0.81rem;
+        font-weight: 800;
+        margin-right: 0.35rem;
+        margin-bottom: 0.25rem;
+      }
       .result-title { font-size: 1.03rem; font-weight: 800; color: #0f172a; margin-bottom: 0.3rem; }
       .result-meta { color: #6b7280; font-size: 0.88rem; margin-bottom: 0.55rem; }
+      .result-date-red { color: #b91c1c; font-weight: 800; }
       .result-body {
         white-space: pre-wrap;
         line-height: 1.65;
@@ -87,10 +97,16 @@ st.markdown(
         padding: 0.95rem;
         border-radius: 14px;
       }
+      .result-body a {
+        white-space: nowrap;
+        display: inline-block;
+        word-break: normal;
+        overflow-wrap: normal;
+      }
       .small-note { color: #6b7280; font-size: 0.88rem; }
       hr.soft { border: none; border-top: 1px solid #e5e7eb; margin: 0.75rem 0 1rem 0; }
       div[data-baseweb="input"] input { border-radius: 14px !important; }
-      div[data-baseweb="select"] > div { border-radius: 14px !important; }
+      div[data-baseweb="textarea"] textarea { border-radius: 14px !important; }
       .stDownloadButton button { border-radius: 14px !important; font-weight: 700; }
       a { text-decoration: none; }
     </style>
@@ -98,14 +114,9 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# Match both styles and messy variants:
-# - GTS260030_Web...
-# - GTS-217638-GTS260030_Web...
-# - GTS250106
-# - GTS 250106
-# Keep it forgiving.
 GTS_RE = re.compile(r"(?i)GTS(?:[-_\s]*)(\d+)")
 DASH_LINE_RE = re.compile(r"^\s*-{8,}\s*$")
+COMPLETED_RE = re.compile(r"(?i)\b(?:job\s+has\s+been\s+completed|the\s+job\s+has\s+been\s+completed|work\s+completed)\b")
 
 
 @dataclass
@@ -120,6 +131,7 @@ class ParsedEmail:
     body_markdown: str
     combined_text: str
     match_reason: str = ""
+    completed_flag: bool = False
 
 
 def reset_app() -> None:
@@ -128,6 +140,7 @@ def reset_app() -> None:
         "uploaded_bytes",
         "parsed_emails",
         "search_term",
+        "search_term_input",
         "search_results",
         "sort_order",
     ]:
@@ -167,9 +180,6 @@ def decode_payload(part: Message) -> str:
 
 
 def get_best_body(msg: Message) -> tuple[str, str]:
-    """
-    Return (html_body, plain_body). Prefer html when present.
-    """
     html_body = ""
     plain_body = ""
 
@@ -200,18 +210,26 @@ def get_best_body(msg: Message) -> tuple[str, str]:
     return html_body.strip(), plain_body.strip()
 
 
-def normalize_separator_text(text: str) -> str:
-    return re.sub(r"\s+", "", text or "")
-
-
 def is_separator_text(text: str) -> bool:
     return bool(DASH_LINE_RE.match((text or "").strip()))
+
+
+def normalize_name(text: str) -> str:
+    text = text.lower()
+    text = re.sub(r"[^a-z0-9]+", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def contains_any_person(text: str, names: list[str]) -> bool:
+    norm_text = normalize_name(text)
+    if not norm_text or not names:
+        return False
+    return any(normalize_name(name) and normalize_name(name) in norm_text for name in names)
 
 
 def node_to_markdown(node) -> str:
     if isinstance(node, NavigableString):
         return str(node)
-
     if not isinstance(node, Tag):
         return ""
 
@@ -225,19 +243,12 @@ def node_to_markdown(node) -> str:
         href = (node.get("href") or "").strip()
         if href and label:
             return f"[{label}]({href})"
-        if href and not label:
-            return href
-        return label
+        return href or label
 
     if name in {"p", "div", "li", "tr", "section", "article", "blockquote"}:
-        chunks = []
-        for child in node.children:
-            chunks.append(node_to_markdown(child))
-        text = "".join(chunks)
-        text = html_to_plain(text) if name in {"tr"} else text
+        text = "".join(node_to_markdown(child) for child in node.children)
         if name == "li":
-            text = "- " + clean_text(text)
-            return text + "\n"
+            return f"- {clean_text(text)}\n"
         return clean_text(text) + "\n\n"
 
     if name in {"strong", "b"}:
@@ -265,12 +276,8 @@ def html_fragment_to_markdown(fragment_html: str) -> str:
     if not fragment_html.strip():
         return ""
     soup = BeautifulSoup(fragment_html, "html.parser")
-    chunks = []
-    for child in soup.contents:
-        chunks.append(node_to_markdown(child))
-    text = "".join(chunks)
-    text = text.replace("\r\n", "\n").replace("\r", "\n")
-    # Preserve line breaks and keep the output tidy
+    chunks = [node_to_markdown(child) for child in soup.contents]
+    text = "".join(chunks).replace("\r\n", "\n").replace("\r", "\n")
     text = re.sub(r"[ \t]+\n", "\n", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
@@ -278,14 +285,9 @@ def html_fragment_to_markdown(fragment_html: str) -> str:
 
 def extract_html_between_separators(html_body: str) -> str:
     soup = BeautifulSoup(html_body, "html.parser")
-    tags = soup.find_all(True)
-    sep_tags = []
-    for tag in tags:
-        if is_separator_text(tag.get_text(" ", strip=True)):
-            sep_tags.append(tag)
+    sep_tags = [tag for tag in soup.find_all(True) if is_separator_text(tag.get_text(" ", strip=True))]
     if len(sep_tags) >= 2:
-        first = sep_tags[0]
-        second = sep_tags[1]
+        first, second = sep_tags[0], sep_tags[1]
         fragments = []
         for sib in first.next_siblings:
             if sib == second:
@@ -294,7 +296,6 @@ def extract_html_between_separators(html_body: str) -> str:
                 continue
             fragments.append(str(sib))
         return html_fragment_to_markdown("".join(fragments))
-
     return html_fragment_to_markdown(html_body)
 
 
@@ -359,16 +360,12 @@ def parse_message(idx: int, msg: Message) -> ParsedEmail:
 
     if html_body:
         body_markdown = extract_html_between_separators(html_body)
+        full_text = html_to_plain(html_body)
     else:
         body_markdown = extract_plain_between_separators(plain_body)
+        full_text = plain_body
 
-    # For searching, use both the visible markdown and the full raw text.
-    combined = clean_text(
-        f"{subject}\n"
-        f"{html_to_plain(html_body) if html_body else plain_body}\n"
-        f"{body_markdown}"
-    )
-
+    combined = clean_text(f"{subject}\n{full_text}\n{body_markdown}")
     ids = extract_ids(combined)
     display_id = extract_display_id(ids)
 
@@ -386,7 +383,7 @@ def parse_message(idx: int, msg: Message) -> ParsedEmail:
 
 
 def parse_mbox_file(path: Path) -> list[ParsedEmail]:
-    parsed: list[ParsedEmail] = []
+    parsed = []
     mbox = mailbox.mbox(str(path), factory=None, create=False)
     try:
         for idx, msg in enumerate(mbox):
@@ -410,7 +407,6 @@ def parse_eml_file(path: Path) -> ParsedEmail:
 
 def parse_uploaded_file(uploaded_bytes: bytes, filename: str) -> list[ParsedEmail]:
     name = filename.lower()
-
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)
         raw_path = tmp / filename
@@ -421,15 +417,12 @@ def parse_uploaded_file(uploaded_bytes: bytes, filename: str) -> list[ParsedEmai
             extracted.mkdir(exist_ok=True)
             with zipfile.ZipFile(raw_path, "r") as zf:
                 zf.extractall(extracted)
-
             for candidate in extracted.rglob("*"):
                 if candidate.is_file() and candidate.name.lower() == "mbox":
                     return parse_mbox_file(candidate)
-
             for candidate in extracted.rglob("*.mbox"):
                 if candidate.is_file():
                     return parse_mbox_file(candidate)
-
             emls = [p for p in extracted.rglob("*") if p.is_file() and p.suffix.lower() in {".eml", ".emlx"}]
             if emls:
                 return [parse_eml_file(p) for p in sorted(emls)]
@@ -440,30 +433,31 @@ def parse_uploaded_file(uploaded_bytes: bytes, filename: str) -> list[ParsedEmai
         return parse_mbox_file(raw_path)
 
 
-def match_message(item: ParsedEmail, term: str) -> tuple[bool, str]:
+def should_mark_completed(item: ParsedEmail, names: list[str]) -> bool:
+    return bool(names) and bool(COMPLETED_RE.search(item.combined_text)) and contains_any_person(item.combined_text, names)
+
+
+def match_message(item: ParsedEmail, term: str, names_for_completed: list[str]) -> tuple[bool, str, bool]:
     if not term:
-        return False, ""
+        return False, "", False
 
     if term in item.ids_in_order:
-        return True, "matched extracted ID"
+        return True, "matched extracted ID", should_mark_completed(item, names_for_completed)
 
     raw = item.combined_text
-
-    # Exact number near GTS in the raw body or subject
     if re.search(rf"(?is)GTS(?:[-_\s]*\d+)?[-_\s]*{re.escape(term)}(?!\d)", raw):
-        return True, "matched flexible GTS token in raw text"
+        return True, "matched flexible GTS token in raw text", should_mark_completed(item, names_for_completed)
 
-    # Raw proximity fallback if the token is split by punctuation or whitespace
     if re.search(rf"(?is)GTS.{0,80}?{re.escape(term)}|{re.escape(term)}.{0,80}?GTS", raw):
-        return True, "matched raw-text proximity to GTS"
+        return True, "matched raw-text proximity to GTS", should_mark_completed(item, names_for_completed)
 
-    return False, ""
+    return False, "", False
 
 
 def build_csv(rows: list[ParsedEmail], search_term: str) -> bytes:
     buf = io.StringIO()
     writer = csv.writer(buf)
-    writer.writerow(["search_term", "subject", "from", "date", "matched_id", "all_ids", "match_reason", "excerpt"])
+    writer.writerow(["search_term", "subject", "from", "date", "matched_id", "all_ids", "match_reason", "completed_flag", "excerpt"])
     for r in rows:
         writer.writerow([
             search_term,
@@ -473,14 +467,19 @@ def build_csv(rows: list[ParsedEmail], search_term: str) -> bytes:
             r.display_id or "",
             " | ".join(r.ids_in_order),
             r.match_reason,
+            "yes" if r.completed_flag else "no",
             r.excerpt_markdown,
         ])
     return buf.getvalue().encode("utf-8")
 
 
-def render_result_card(item: ParsedEmail, search_term: str) -> None:
+def render_result_card(item: ParsedEmail, search_term: str, highlight_latest: bool) -> None:
     matched_id = f"GTS{item.display_id}" if item.display_id else "—"
     all_ids = ", ".join(f"GTS{x}" for x in item.ids_in_order) if item.ids_in_order else "—"
+    completed_badge = '<span class="pill-red">Completed</span>' if item.completed_flag else ""
+    date_html = html.escape(fmt_dt(item.date_utc))
+    if highlight_latest:
+        date_html = f'<span class="result-date-red">{date_html}</span>'
 
     st.markdown(
         f"""
@@ -489,9 +488,10 @@ def render_result_card(item: ParsedEmail, search_term: str) -> None:
           <div class="result-meta">
             <span class="pill">Search ID: {html.escape(search_term)}</span>
             <span class="pill-green">Matched: {html.escape(matched_id)}</span>
+            {completed_badge}
             <span class="pill">All IDs: {html.escape(all_ids)}</span>
           </div>
-          <div class="result-meta">From: {html.escape(item.sender)} • {html.escape(fmt_dt(item.date_utc))}</div>
+          <div class="result-meta">From: {html.escape(item.sender)} • {date_html}</div>
           <div class="result-body">{item.excerpt_markdown}</div>
         </div>
         """,
@@ -500,6 +500,7 @@ def render_result_card(item: ParsedEmail, search_term: str) -> None:
 
     with st.expander("Show match details", expanded=False):
         st.write(f"Matched reason: {item.match_reason or 'n/a'}")
+        st.write("Completed label:", "yes" if item.completed_flag else "no")
         st.write("Extracted IDs:", item.ids_in_order or ["(none)"])
         st.markdown(item.body_markdown or "(No readable body found)")
 
@@ -508,97 +509,56 @@ st.session_state.setdefault("parsed_emails", [])
 st.session_state.setdefault("search_term", "")
 st.session_state.setdefault("search_results", [])
 st.session_state.setdefault("sort_order", "Oldest first")
+st.session_state.setdefault("search_term_input", "")
+st.session_state.setdefault("names_text", "")
 
-st.markdown(
-    """
-    <div class="hero">
-      <h1>Wordbee Mail Explorer</h1>
-      <p>
-        Upload the Apple Mail <b>mbox</b> export for the <b>wordbee</b> folder, search by the <b>numeric job ID only</b>,
-        and review messages that match the relevant GTS identifier in chronological order.
-      </p>
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
-
-st.write("")
+st.markdown("""
+<div class="hero">
+  <h1>Wordbee Message Tracker</h1>
+</div>
+""", unsafe_allow_html=True)
 
 with st.sidebar:
-    st.markdown("### Quick guide")
-    st.markdown(
-        """
-        <div class="feature-card">
-          <div class="feature-title">What to upload</div>
-          <div class="muted">Use the Apple Mail export file called <b>mbox</b>. The <b>table_of_contents</b> file is not needed. ZIP files are also supported.</div>
-          <hr class="soft">
-          <div class="feature-title">What to search</div>
-          <div class="muted">Type only the digits, for example <b>260030</b> or <b>250106</b>. The app uses flexible matching for the real-world Wordbee format.</div>
-          <hr class="soft">
-          <div class="feature-title">What you will see</div>
-          <div class="muted">Results are shown oldest to newest by default, with only the text between the dashed separator lines. Links are preserved.</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
+    st.markdown("### Completed badge names")
+    st.session_state.names_text = st.text_area(
+        "Paste one name per line",
+        value=st.session_state.names_text,
+        placeholder="Hiromi Weston\nJoseph Massaro\nEmmanuel Lizares",
+        height=170,
+        label_visibility="visible",
     )
 
     st.markdown("### Controls")
-    sort_order = st.radio(
-        "Sort order",
-        ["Oldest first", "Newest first"],
-        index=0 if st.session_state.sort_order == "Oldest first" else 1,
-    )
-    st.session_state.sort_order = sort_order
-
-    if st.button("🔄 Reset everything", use_container_width=True):
+    st.session_state.sort_order = st.radio("Sort order", ["Oldest first", "Newest first"], index=0 if st.session_state.sort_order == "Oldest first" else 1)
+    if st.button("Clear Search", use_container_width=True):
         reset_app()
 
-    st.caption("Clears the upload, search term, and any results.")
+names_for_completed = [line.strip() for line in re.split(r"[\n,;]+", st.session_state.names_text or "") if line.strip()]
 
-left, right = st.columns([1.2, 0.8], gap="large")
-
-with left:
-    uploaded = st.file_uploader(
-        "Upload your exported mailbox",
-        type=None,
-        help="Choose the Apple Mail export file called 'mbox'. If needed, zip the export folder and upload the ZIP.",
-    )
-
-    if uploaded is not None:
-        st.success(f"File uploaded: {uploaded.name} ({uploaded.size:,} bytes)")
-
-    c1, c2 = st.columns([0.72, 0.28], gap="small")
-    with c1:
-        search_term = st.text_input(
-            "Search by numeric job ID",
-            placeholder="Example: 250106 or 260030",
-            value=st.session_state.search_term,
-            help="Do not include the word GTS. Use only the numeric part.",
-        )
-    with c2:
-        do_search = st.button("🔎 Search", use_container_width=True)
-
-    st.markdown('<hr class="soft">', unsafe_allow_html=True)
-
-with right:
-    st.markdown(
-        """
-        <div class="feature-card">
-          <div class="feature-title">Example matches</div>
-          <div class="muted">
-            For <b>GTS-217638-GTS260030_Web...</b>, search for <b>260030</b>.<br><br>
-            For <b>GTS250106_Web...</b> alone, search for <b>250106</b>.
-          </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+uploaded = st.file_uploader(
+    "Upload your exported mailbox",
+    type=None,
+    help="Choose the Apple Mail export file called 'mbox'. If needed, zip the export folder and upload the ZIP.",
+)
 
 if uploaded is not None:
-    needs_parse = (
-        st.session_state.get("uploaded_name") != uploaded.name
-        or st.session_state.get("uploaded_bytes") != uploaded.getvalue()
+    st.success(f"File uploaded: {uploaded.name} ({uploaded.size:,} bytes)")
+
+search_col, button_col = st.columns([0.82, 0.18], gap="small")
+with search_col:
+    st.markdown("### Search by numeric job ID")
+    st.text_input(
+        "",
+        key="search_term_input",
+        placeholder="Example: 250106 or 260030",
+        label_visibility="collapsed",
     )
+with button_col:
+    st.markdown("<div style='height: 2.1rem;'></div>", unsafe_allow_html=True)
+    do_search = st.button("🔎 Search", use_container_width=True)
+
+if uploaded is not None:
+    needs_parse = st.session_state.get("uploaded_name") != uploaded.name or st.session_state.get("uploaded_bytes") != uploaded.getvalue()
     if needs_parse:
         with st.spinner("Reading mailbox and indexing messages..."):
             st.session_state.uploaded_name = uploaded.name
@@ -614,28 +574,25 @@ if uploaded is not None:
         st.info(f"Mailbox already loaded: {len(st.session_state.parsed_emails)} messages indexed.")
 
 if do_search:
-    st.session_state.search_term = re.sub(r"\D+", "", search_term.strip())
-    if not search_term.strip():
+    st.session_state.search_term = re.sub(r"\D+", "", (st.session_state.search_term_input or "").strip())
+    if not st.session_state.search_term:
         st.warning("Please enter the numeric job ID first.")
     elif not st.session_state.parsed_emails:
         st.warning("Upload the mailbox file before searching.")
     else:
         term = st.session_state.search_term
-        results: list[ParsedEmail] = []
+        results = []
         for item in st.session_state.parsed_emails:
-            matched, reason = match_message(item, term)
+            matched, reason, completed_flag = match_message(item, term, names_for_completed)
             if matched:
                 item.match_reason = reason
+                item.completed_flag = completed_flag
                 results.append(item)
-        st.session_state.search_results = sorted(
-            results,
-            key=lambda item: sort_key(item, st.session_state.sort_order == "Newest first"),
-        )
+        st.session_state.search_results = sorted(results, key=lambda item: sort_key(item, st.session_state.sort_order == "Newest first"))
 
 if st.session_state.parsed_emails:
     total = len(st.session_state.parsed_emails)
     matched = len(st.session_state.search_results)
-
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("Messages indexed", f"{total}")
     m2.metric("Matches found", f"{matched}")
@@ -648,6 +605,15 @@ if st.session_state.parsed_emails:
     if st.session_state.search_results:
         st.markdown(f"### Results for `{st.session_state.search_term}`")
         st.caption("Displayed in the order you selected. Each card shows only the content between the dashed separator lines.")
+
+        latest_dt = None
+        for item in st.session_state.search_results:
+            if item.date_utc and (latest_dt is None or item.date_utc > latest_dt):
+                latest_dt = item.date_utc
+
+        now_utc = datetime.now(timezone.utc)
+        latest_is_stale = bool(latest_dt and (now_utc - latest_dt) > timedelta(days=2))
+
         st.download_button(
             "⬇️ Download CSV",
             data=build_csv(st.session_state.search_results, st.session_state.search_term),
@@ -655,18 +621,9 @@ if st.session_state.parsed_emails:
             mime="text/csv",
         )
         for item in st.session_state.search_results:
-            render_result_card(item, st.session_state.search_term)
+            render_result_card(item, st.session_state.search_term, highlight_latest=(latest_is_stale and item.date_utc == latest_dt))
     elif st.session_state.search_term:
         st.markdown("### No matches yet")
         st.caption("Try another numeric ID, or confirm the email contains a supported GTS identifier.")
 else:
     st.info("Upload the exported mailbox file to begin.")
-
-st.markdown(
-    """
-    <div class="small-note">
-      Tip: Apple Mail export creates the <b>mbox</b> file you need. The <b>table_of_contents</b> file is only metadata.
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
