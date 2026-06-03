@@ -2,14 +2,18 @@ import csv
 import html
 import io
 import mailbox
+import os
 import re
 import tempfile
+import zipfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from email import policy
 from email.message import Message
+from email.parser import BytesParser
 from email.utils import parsedate_to_datetime
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Iterable
 
 import streamlit as st
 
@@ -92,10 +96,15 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+# We support the common Wordbee patterns:
+# - GTS260030_Web...
+# - GTS-217638-GTS260030_Web...
+# - GTS250106...
+# - GTS 250106 ...
+# and we intentionally keep this forgiving.
+GTS_RE = re.compile(r"(?i)\bGTS(?:[-_\s]*)(\d+)")
 DASH_LINE_RE = re.compile(r"^\s*-{8,}\s*$")
-# Important fix: do NOT require a trailing word boundary, because IDs often appear
-# before underscores, hyphens, or other punctuation like GTS260030_Web...
-GTS_RE = re.compile(r"(?i)GTS[-_ ]?(\d+)")
+NUM_RE = re.compile(r"\d+")
 
 
 @dataclass
@@ -104,10 +113,12 @@ class ParsedEmail:
     subject: str
     sender: str
     date_utc: Optional[datetime]
-    match_id: Optional[str]
-    all_gts_ids: list[str]
+    ids_in_order: list[str]
+    display_id: Optional[str]
     excerpt: str
     body: str
+    combined_text: str
+    match_reason: str = ""
 
 
 def reset_app() -> None:
@@ -132,29 +143,44 @@ def clean_text(text: str) -> str:
 
 
 def html_to_text(text: str) -> str:
-    text = re.sub(r"(?is)<(script|style).*?>.*?(</\\1>)", " ", text)
-    text = re.sub(r"(?s)<[^>]*>", " ", text)
     text = html.unescape(text)
+    text = re.sub(r"(?is)<(script|style).*?>.*?(</\1>)", " ", text)
+    text = re.sub(r"(?s)<[^>]*>", " ", text)
     text = re.sub(r"\s+", " ", text)
     return text.strip()
 
 
+def decode_payload(part: Message) -> str:
+    try:
+        payload = part.get_payload(decode=True)
+        if payload is None:
+            raw = part.get_payload()
+            return raw if isinstance(raw, str) else ""
+        charset = part.get_content_charset() or "utf-8"
+        return payload.decode(charset, errors="replace")
+    except Exception:
+        try:
+            raw = part.get_payload()
+            return raw if isinstance(raw, str) else ""
+        except Exception:
+            return ""
+
+
 def extract_payload_text(msg: Message) -> str:
-    parts = []
+    """
+    Return the best available message text. We try plain text first, then HTML.
+    """
+    parts: list[str] = []
     if msg.is_multipart():
         for part in msg.walk():
             if part.get_content_maintype() == "multipart":
                 continue
             if (part.get_content_disposition() or "").lower() == "attachment":
                 continue
+
             content_type = (part.get_content_type() or "").lower()
-            try:
-                payload = part.get_payload(decode=True)
-                if payload is None:
-                    continue
-                charset = part.get_content_charset() or "utf-8"
-                decoded = payload.decode(charset, errors="replace")
-            except Exception:
+            decoded = decode_payload(part)
+            if not decoded:
                 continue
 
             if content_type == "text/plain":
@@ -162,19 +188,12 @@ def extract_payload_text(msg: Message) -> str:
             elif content_type == "text/html" and not parts:
                 parts.append(html_to_text(decoded))
     else:
-        try:
-            payload = msg.get_payload(decode=True)
-            if payload is None:
-                raw = msg.get_payload()
-                return clean_text(raw if isinstance(raw, str) else "")
-            charset = msg.get_content_charset() or "utf-8"
-            decoded = payload.decode(charset, errors="replace")
-            if (msg.get_content_type() or "").lower() == "text/html":
-                decoded = html_to_text(decoded)
-            return clean_text(decoded)
-        except Exception:
-            raw = msg.get_payload()
-            return clean_text(raw if isinstance(raw, str) else "")
+        decoded = decode_payload(msg)
+        if not decoded:
+            return ""
+        if (msg.get_content_type() or "").lower() == "text/html":
+            decoded = html_to_text(decoded)
+        return clean_text(decoded)
 
     return clean_text("\n".join(parts))
 
@@ -191,15 +210,35 @@ def extract_between_separator_lines(text: str) -> str:
     return clean_text(text)
 
 
-def gts_ids_in_text(text: str) -> list[str]:
-    return GTS_RE.findall(text)
+def extract_ids(text: str) -> list[str]:
+    """
+    Flexible ID extraction:
+    - matches GTS260030
+    - matches GTS-217638
+    - matches GTS 250106
+    - tolerates HTML-cleaned or lightly split formatting
+    """
+    ids = GTS_RE.findall(text)
+    # Deduplicate while preserving order
+    seen = set()
+    ordered = []
+    for i in ids:
+        if i not in seen:
+            seen.add(i)
+            ordered.append(i)
+    return ordered
 
 
-def match_id_from_gts_ids(ids: list[str]) -> Optional[str]:
+def extract_display_id(ids: list[str]) -> Optional[str]:
+    """
+    For the two-ID format, prefer the second ID.
+    For the one-ID format, use that single ID.
+    If no IDs are extracted, return None.
+    """
     if len(ids) >= 2:
-        return ids[1]  # keep the second one for the two-GTS format
+        return ids[1]
     if len(ids) == 1:
-        return ids[0]  # support the single-GTS format
+        return ids[0]
     return None
 
 
@@ -227,69 +266,151 @@ def sort_key(item: ParsedEmail, newest_first: bool):
     return -dt.timestamp() if newest_first else dt.timestamp()
 
 
-@st.cache_data(show_spinner=False)
-def parse_mbox_bytes(uploaded_bytes: bytes, filename: str) -> list[ParsedEmail]:
-    with tempfile.TemporaryDirectory() as tmpdir:
-        temp_path = Path(tmpdir) / filename
-        temp_path.write_bytes(uploaded_bytes)
+def try_message_from_bytes(data: bytes) -> Message:
+    return BytesParser(policy=policy.default).parsebytes(data)
 
-        mbox = mailbox.mbox(str(temp_path), factory=None, create=False)
-        parsed: list[ParsedEmail] = []
 
+def parse_mbox_file(path: Path) -> list[ParsedEmail]:
+    parsed: list[ParsedEmail] = []
+    mbox = mailbox.mbox(str(path), factory=None, create=False)
+    try:
+        for idx, msg in enumerate(mbox):
+            parsed.append(parse_message(idx, msg))
+    finally:
         try:
-            for idx, msg in enumerate(mbox):
-                try:
-                    subject = str(msg.get("subject", "(No subject)"))
-                    sender = str(msg.get("from", "(Unknown sender)"))
-                    date_utc = parse_date(msg)
-                    body = extract_payload_text(msg)
-                    combined = clean_text(f"{subject}\n{body}")
-                    ids = gts_ids_in_text(combined)
-                    match_id = match_id_from_gts_ids(ids)
-                    excerpt = extract_between_separator_lines(body)
-                    parsed.append(
-                        ParsedEmail(
-                            index=idx,
-                            subject=subject,
-                            sender=sender,
-                            date_utc=date_utc,
-                            match_id=match_id,
-                            all_gts_ids=ids,
-                            excerpt=excerpt,
-                            body=body,
-                        )
-                    )
-                except Exception:
-                    continue
-        finally:
-            try:
-                mbox.close()
-            except Exception:
-                pass
-
+            mbox.close()
+        except Exception:
+            pass
     return parsed
+
+
+def parse_eml_file(path: Path) -> ParsedEmail:
+    data = path.read_bytes()
+    msg = try_message_from_bytes(data)
+    return parse_message(0, msg)
+
+
+def parse_message(idx: int, msg: Message) -> ParsedEmail:
+    subject = str(msg.get("subject", "(No subject)"))
+    sender = str(msg.get("from", "(Unknown sender)"))
+    date_utc = parse_date(msg)
+
+    body = extract_payload_text(msg)
+    combined = clean_text(f"{subject}\n{body}")
+
+    ids = extract_ids(combined)
+    display_id = extract_display_id(ids)
+    excerpt = extract_between_separator_lines(body)
+
+    return ParsedEmail(
+        index=idx,
+        subject=subject,
+        sender=sender,
+        date_utc=date_utc,
+        ids_in_order=ids,
+        display_id=display_id,
+        excerpt=excerpt,
+        body=body,
+        combined_text=combined,
+    )
+
+
+def parse_uploaded_file(uploaded_bytes: bytes, filename: str) -> list[ParsedEmail]:
+    """
+    Supports:
+    - direct mbox file
+    - zip archive containing an mbox file or .eml files
+    - direct .eml file
+    """
+    name = filename.lower()
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        raw_path = tmp / filename
+        raw_path.write_bytes(uploaded_bytes)
+
+        # ZIP containing mbox or eml files
+        if zipfile.is_zipfile(raw_path) or name.endswith(".zip"):
+            extracted = tmp / "unzipped"
+            extracted.mkdir(exist_ok=True)
+            with zipfile.ZipFile(raw_path, "r") as zf:
+                zf.extractall(extracted)
+
+            # Try to find an mbox first
+            for candidate in extracted.rglob("*"):
+                if candidate.is_file() and candidate.name.lower() == "mbox":
+                    return parse_mbox_file(candidate)
+            # Or any .mbox
+            for candidate in extracted.rglob("*.mbox"):
+                if candidate.is_file():
+                    return parse_mbox_file(candidate)
+            # Or parse individual .eml files
+            emls = [p for p in extracted.rglob("*") if p.is_file() and p.suffix.lower() in {".eml", ".emlx"}]
+            if emls:
+                return [parse_eml_file(p) for p in sorted(emls)]
+            # Fall through and try raw as mbox
+        # Direct EML
+        elif name.endswith(".eml") or name.endswith(".emlx"):
+            return [parse_eml_file(raw_path)]
+
+        # Default: assume mbox even if no extension
+        return parse_mbox_file(raw_path)
+
+
+def match_message(item: ParsedEmail, term: str) -> tuple[bool, str]:
+    """
+    Search logic:
+    1) Exact match against extracted IDs.
+    2) Exact number within any GTS-like token in subject/body.
+    3) A forgiving raw-text fallback around GTS.
+    """
+    if not term:
+        return False, ""
+
+    # Straight ID match if we extracted it.
+    if term in item.ids_in_order:
+        if len(item.ids_in_order) >= 2 and item.display_id == term:
+            return True, "matched extracted display ID"
+        if len(item.ids_in_order) == 1 and item.display_id == term:
+            return True, "matched single extracted ID"
+        return True, "matched extracted ID"
+
+    # Search the raw combined text for a GTS token containing the target number.
+    raw = item.combined_text
+
+    # Matches things like GTS260030_Web..., GTS-217638-GTS260030..., GTS 250106 ...
+    if re.search(rf"(?is)GTS(?:[-_\s]*\d+)?[-_\s]*{re.escape(term)}(?!\d)", raw):
+        return True, "matched flexible GTS token in raw text"
+
+    # If the number appears near GTS but tokenization is messy, still treat as match.
+    if re.search(rf"(?is)GTS.{0,80}?{re.escape(term)}|{re.escape(term)}.{0,80}?GTS", raw):
+        return True, "matched raw-text proximity to GTS"
+
+    return False, ""
 
 
 def build_csv(rows: list[ParsedEmail], search_term: str) -> bytes:
     buf = io.StringIO()
     writer = csv.writer(buf)
-    writer.writerow(["search_term", "subject", "from", "date", "matched_gts_id", "all_gts_ids", "excerpt"])
+    writer.writerow(["search_term", "subject", "from", "date", "matched_id", "all_ids", "match_reason", "excerpt"])
     for r in rows:
         writer.writerow([
             search_term,
             r.subject,
             r.sender,
             fmt_dt(r.date_utc),
-            r.match_id or "",
-            " | ".join(r.all_gts_ids),
+            r.display_id or "",
+            " | ".join(r.ids_in_order),
+            r.match_reason,
             r.excerpt,
         ])
     return buf.getvalue().encode("utf-8")
 
 
 def render_result_card(item: ParsedEmail, search_term: str) -> None:
-    matched_id = f"GTS{item.match_id}" if item.match_id else "—"
-    all_ids = ", ".join(f"GTS{x}" for x in item.all_gts_ids) if item.all_gts_ids else "—"
+    matched_id = f"GTS{item.display_id}" if item.display_id else "—"
+    all_ids = ", ".join(f"GTS{x}" for x in item.ids_in_order) if item.ids_in_order else "—"
+
     st.markdown(
         f"""
         <div class="result-card">
@@ -297,7 +418,7 @@ def render_result_card(item: ParsedEmail, search_term: str) -> None:
           <div class="result-meta">
             <span class="pill">Search ID: {html.escape(search_term)}</span>
             <span class="pill-green">Matched: {html.escape(matched_id)}</span>
-            <span class="pill">Found in email: {html.escape(all_ids)}</span>
+            <span class="pill">All IDs: {html.escape(all_ids)}</span>
           </div>
           <div class="result-meta">From: {html.escape(item.sender)} • {html.escape(fmt_dt(item.date_utc))}</div>
           <div class="result-excerpt">{html.escape(item.excerpt or "(No readable body found)")}</div>
@@ -305,15 +426,18 @@ def render_result_card(item: ParsedEmail, search_term: str) -> None:
         """,
         unsafe_allow_html=True,
     )
-    with st.expander("Show full extracted body", expanded=False):
+
+    with st.expander("Show match details", expanded=False):
+        st.write(f"Matched reason: {item.match_reason or 'n/a'}")
+        st.write("Extracted IDs:", item.ids_in_order or ["(none)"])
         st.text(item.body or "(No readable body found)")
 
 
+# Session defaults
 st.session_state.setdefault("parsed_emails", [])
 st.session_state.setdefault("search_term", "")
 st.session_state.setdefault("search_results", [])
 st.session_state.setdefault("sort_order", "Oldest first")
-st.session_state.setdefault("upload_status", "")
 
 st.markdown(
     """
@@ -336,10 +460,10 @@ with st.sidebar:
         """
         <div class="feature-card">
           <div class="feature-title">What to upload</div>
-          <div class="muted">Use the Apple Mail export file called <b>mbox</b>. The <b>table_of_contents</b> file is not needed.</div>
+          <div class="muted">Use the Apple Mail export file called <b>mbox</b>. The <b>table_of_contents</b> file is not needed. ZIP files are also supported.</div>
           <hr class="soft">
           <div class="feature-title">What to search</div>
-          <div class="muted">Type only the digits, for example <b>260030</b> or <b>250106</b>. The app now matches IDs even when they appear before an underscore or hyphen, like <b>GTS260030_Web...</b></div>
+          <div class="muted">Type only the digits, for example <b>260030</b> or <b>250106</b>. The app uses the best available GTS match, including messy real-world formatting.</div>
           <hr class="soft">
           <div class="feature-title">What you will see</div>
           <div class="muted">Results are shown oldest to newest by default, with only the text between the two dashed separator lines.</div>
@@ -349,11 +473,16 @@ with st.sidebar:
     )
 
     st.markdown("### Controls")
-    sort_order = st.radio("Sort order", ["Oldest first", "Newest first"], index=0 if st.session_state.sort_order == "Oldest first" else 1)
+    sort_order = st.radio(
+        "Sort order",
+        ["Oldest first", "Newest first"],
+        index=0 if st.session_state.sort_order == "Oldest first" else 1,
+    )
     st.session_state.sort_order = sort_order
 
     if st.button("🔄 Reset everything", use_container_width=True):
         reset_app()
+
     st.caption("Clears the upload, search term, and any results.")
 
 left, right = st.columns([1.2, 0.8], gap="large")
@@ -362,12 +491,11 @@ with left:
     uploaded = st.file_uploader(
         "Upload your exported mailbox",
         type=None,
-        help="Choose the Apple Mail export file called 'mbox'. If you cannot select it, try zipping the file and uploading the ZIP.",
+        help="Choose the Apple Mail export file called 'mbox'. If needed, zip the export folder and upload the ZIP.",
     )
 
     if uploaded is not None:
         st.success(f"File uploaded: {uploaded.name} ({uploaded.size:,} bytes)")
-        st.session_state.upload_status = f"{uploaded.name} • {uploaded.size:,} bytes"
 
     c1, c2 = st.columns([0.72, 0.28], gap="small")
     with c1:
@@ -405,7 +533,11 @@ if uploaded is not None:
         with st.spinner("Reading mailbox and indexing messages..."):
             st.session_state.uploaded_name = uploaded.name
             st.session_state.uploaded_bytes = uploaded.getvalue()
-            st.session_state.parsed_emails = parse_mbox_bytes(uploaded.getvalue(), uploaded.name)
+            try:
+                st.session_state.parsed_emails = parse_uploaded_file(uploaded.getvalue(), uploaded.name)
+            except Exception as e:
+                st.session_state.parsed_emails = []
+                st.error(f"Could not parse the uploaded file: {e}")
             st.session_state.search_results = []
         st.success(f"Mailbox indexed: {len(st.session_state.parsed_emails)} messages ready.")
     elif st.session_state.parsed_emails:
@@ -419,9 +551,14 @@ if do_search:
         st.warning("Upload the mailbox file before searching.")
     else:
         term = st.session_state.search_term
-        st.session_state.search_results = [item for item in st.session_state.parsed_emails if item.match_id == term]
+        results: list[ParsedEmail] = []
+        for item in st.session_state.parsed_emails:
+            matched, reason = match_message(item, term)
+            if matched:
+                item.match_reason = reason
+                results.append(item)
         st.session_state.search_results = sorted(
-            st.session_state.search_results,
+            results,
             key=lambda item: sort_key(item, st.session_state.sort_order == "Newest first"),
         )
 
