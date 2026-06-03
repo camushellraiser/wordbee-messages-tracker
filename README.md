@@ -4,9 +4,10 @@ A polished Streamlit app for searching Apple Mail **mbox** exports from the `wor
 
 ## What it does
 - Upload the exported **mbox** file
-- Search by the **numeric job ID only** (for example `260030` or `250106`)
-- Match the **second GTS ID** when there are two
-- Match the **single GTS ID** when there is only one
+- Search by the **numeric job ID only**
+- Match IDs in both message styles:
+  - one GTS identifier
+  - two GTS identifiers, where the second is the key one
 - Show results in chronological order
 - Display only the text between the two dashed separator lines
 - Download matched results as CSV
@@ -16,11 +17,4 @@ A polished Streamlit app for searching Apple Mail **mbox** exports from the `wor
 ```bash
 pip install -r requirements.txt
 streamlit run app.py
-```
-
-## Streamlit Cloud
-Set the app entry point to:
-
-```text
-app.py
 ```

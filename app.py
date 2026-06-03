@@ -93,7 +93,9 @@ st.markdown(
 )
 
 DASH_LINE_RE = re.compile(r"^\s*-{8,}\s*$")
-GTS_RE = re.compile(r"(?i)\bGTS[-_ ]?(\d+)\b")
+# Important fix: do NOT require a trailing word boundary, because IDs often appear
+# before underscores, hyphens, or other punctuation like GTS260030_Web...
+GTS_RE = re.compile(r"(?i)GTS[-_ ]?(\d+)")
 
 
 @dataclass
@@ -195,9 +197,9 @@ def gts_ids_in_text(text: str) -> list[str]:
 
 def match_id_from_gts_ids(ids: list[str]) -> Optional[str]:
     if len(ids) >= 2:
-        return ids[1]   # keep the second one for the two-GTS format
+        return ids[1]  # keep the second one for the two-GTS format
     if len(ids) == 1:
-        return ids[0]   # support the single-GTS format
+        return ids[0]  # support the single-GTS format
     return None
 
 
@@ -337,7 +339,7 @@ with st.sidebar:
           <div class="muted">Use the Apple Mail export file called <b>mbox</b>. The <b>table_of_contents</b> file is not needed.</div>
           <hr class="soft">
           <div class="feature-title">What to search</div>
-          <div class="muted">Type only the digits, for example <b>260030</b>. The app matches the <b>second GTS</b> when there are two, and the <b>single GTS</b> when there is only one.</div>
+          <div class="muted">Type only the digits, for example <b>260030</b> or <b>250106</b>. The app now matches IDs even when they appear before an underscore or hyphen, like <b>GTS260030_Web...</b></div>
           <hr class="soft">
           <div class="feature-title">What you will see</div>
           <div class="muted">Results are shown oldest to newest by default, with only the text between the two dashed separator lines.</div>
@@ -347,11 +349,7 @@ with st.sidebar:
     )
 
     st.markdown("### Controls")
-    sort_order = st.radio(
-        "Sort order",
-        ["Oldest first", "Newest first"],
-        index=0 if st.session_state.sort_order == "Oldest first" else 1,
-    )
+    sort_order = st.radio("Sort order", ["Oldest first", "Newest first"], index=0 if st.session_state.sort_order == "Oldest first" else 1)
     st.session_state.sort_order = sort_order
 
     if st.button("🔄 Reset everything", use_container_width=True):
@@ -390,8 +388,8 @@ with right:
         <div class="feature-card">
           <div class="feature-title">Example matches</div>
           <div class="muted">
-            For <b>GTS-217638-GTS260030</b>, search for <b>260030</b>.<br><br>
-            For <b>GTS250106</b> alone, search for <b>250106</b>.
+            For <b>GTS-217638-GTS260030_Web...</b>, search for <b>260030</b>.<br><br>
+            For <b>GTS250106_Web...</b> alone, search for <b>250106</b>.
           </div>
         </div>
         """,
