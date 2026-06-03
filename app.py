@@ -128,7 +128,6 @@ class ParsedEmail:
     date_utc: Optional[datetime]
     ids_in_order: list[str]
     display_id: Optional[str]
-    excerpt_markdown: str
     body_markdown: str
     combined_text: str
     match_reason: str = ""
@@ -370,7 +369,6 @@ def parse_message(idx: int, msg: Message) -> ParsedEmail:
         date_utc=date_utc,
         ids_in_order=ids,
         display_id=display_id,
-        excerpt_markdown=body_markdown,
         body_markdown=body_markdown,
         combined_text=combined,
     )
@@ -451,7 +449,7 @@ def match_message(item: ParsedEmail, term: str, names_for_completed: list[str]) 
 def build_csv(rows: list[ParsedEmail], search_term: str) -> bytes:
     buf = io.StringIO()
     writer = csv.writer(buf)
-    writer.writerow(["search_term", "subject", "from", "date", "matched_id", "all_ids", "match_reason", "completed_flag", "excerpt"])
+    writer.writerow(["search_term", "subject", "from", "date", "matched_id", "match_reason", "completed_flag", "excerpt"])
     for r in rows:
         writer.writerow([
             search_term,
@@ -459,10 +457,9 @@ def build_csv(rows: list[ParsedEmail], search_term: str) -> bytes:
             r.sender,
             fmt_dt(r.date_utc),
             r.display_id or "",
-            " | ".join(r.ids_in_order),
             r.match_reason,
             "yes" if r.completed_flag else "no",
-            r.excerpt_markdown,
+            r.body_markdown,
         ])
     return buf.getvalue().encode("utf-8")
 
@@ -488,12 +485,12 @@ def render_result_card(item: ParsedEmail, search_term: str, highlight_latest: bo
         unsafe_allow_html=True,
     )
 
-    st.markdown(f"<div class='result-body'>{item.excerpt_markdown}</div>", unsafe_allow_html=True)
+    # Render email body separately so no HTML from the card leaks into the message.
+    st.markdown(f"<div class='result-body'>{item.body_markdown}</div>", unsafe_allow_html=True)
 
     with st.expander("Show match details", expanded=False):
         st.write(f"Matched reason: {item.match_reason or 'n/a'}")
         st.write("Extracted IDs:", item.ids_in_order or ["(none)"])
-        st.markdown(item.body_markdown or "(No readable body found)")
 
 
 st.session_state.setdefault("parsed_emails", [])
@@ -503,11 +500,14 @@ st.session_state.setdefault("sort_order", "Oldest first")
 st.session_state.setdefault("search_term_input", "")
 st.session_state.setdefault("names_text", "")
 
-st.markdown("""
-<div class="hero">
-  <h1>Wordbee Message Tracker</h1>
-</div>
-""", unsafe_allow_html=True)
+st.markdown(
+    """
+    <div class="hero">
+      <h1>Wordbee Message Tracker</h1>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
 
 with st.sidebar:
     st.markdown("### Completed badge names")
@@ -573,7 +573,10 @@ if do_search:
                 item.match_reason = reason
                 item.completed_flag = completed_flag
                 results.append(item)
-        st.session_state.search_results = sorted(results, key=lambda item: sort_key(item, st.session_state.sort_order == "Newest first"))
+        st.session_state.search_results = sorted(
+            results,
+            key=lambda item: sort_key(item, st.session_state.sort_order == "Newest first")
+        )
 
 if st.session_state.parsed_emails:
     total = len(st.session_state.parsed_emails)
