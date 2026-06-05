@@ -138,6 +138,10 @@ STATUS_STEPS = [
     "Promote and Publish",
     "Check Published content",
 ]
+FINAL_STATUS_STEPS = [
+    "Escalated to IT",
+    "Completed",
+]
 STATUS_JSON_VERSION = 1
 
 
@@ -662,6 +666,7 @@ def build_csv(rows: list[ParsedEmail], search_term: str) -> bytes:
 def default_status_record() -> dict:
     return {
         "steps": {step: False for step in STATUS_STEPS},
+        "final_status": {step: False for step in FINAL_STATUS_STEPS},
         "updated_at": None,
     }
 
@@ -675,6 +680,11 @@ def normalize_status_record(record) -> dict:
     if isinstance(steps, dict):
         for step in STATUS_STEPS:
             normalized["steps"][step] = bool(steps.get(step, False))
+
+    final_status = record.get("final_status") if isinstance(record.get("final_status"), dict) else record
+    if isinstance(final_status, dict):
+        for step in FINAL_STATUS_STEPS:
+            normalized["final_status"][step] = bool(final_status.get(step, False))
 
     updated_at = record.get("updated_at")
     if isinstance(updated_at, str):
@@ -728,11 +738,42 @@ def sync_status_from_widgets(job_id: str) -> None:
     store["jobs"][job_id] = job
 
 
+def final_status_widget_key(job_id: str, step_name: str) -> str:
+    return f"final_status::{job_id}::{step_name}"
+
+
+def ensure_final_status_widgets(job_id: str) -> None:
+    job = status_store()["jobs"].setdefault(job_id, default_status_record())
+    final_status = job.setdefault("final_status", {step: False for step in FINAL_STATUS_STEPS})
+    for step in FINAL_STATUS_STEPS:
+        key = final_status_widget_key(job_id, step)
+        if key not in st.session_state:
+            st.session_state[key] = bool(final_status.get(step, False))
+
+
+def sync_final_status_from_widgets(job_id: str) -> None:
+    store = status_store()
+    job = store["jobs"].setdefault(job_id, default_status_record())
+    final_status = job.setdefault("final_status", {step: False for step in FINAL_STATUS_STEPS})
+    for step in FINAL_STATUS_STEPS:
+        final_status[step] = bool(st.session_state.get(final_status_widget_key(job_id, step), False))
+    job["updated_at"] = datetime.now(timezone.utc).isoformat()
+    store["jobs"][job_id] = job
+
+
+def job_final_status_active(job_id: str) -> bool:
+    job = status_store()["jobs"].get(job_id, {})
+    final_status = job.get("final_status", {}) if isinstance(job, dict) else {}
+    return any(bool(final_status.get(step, False)) for step in FINAL_STATUS_STEPS)
+
+
 def reset_status_for_job(job_id: str) -> None:
     store = status_store()
     store["jobs"][job_id] = default_status_record()
     for idx, _step in enumerate(STATUS_STEPS):
         st.session_state[status_widget_key(job_id, idx)] = False
+    for step in FINAL_STATUS_STEPS:
+        st.session_state[final_status_widget_key(job_id, step)] = False
 
 
 def export_status_json() -> bytes:
@@ -774,6 +815,7 @@ def render_result_card(item: ParsedEmail, search_term: str, highlight_latest: bo
 
 def render_status_panel(job_id: str) -> None:
     ensure_status_widgets(job_id)
+    ensure_final_status_widgets(job_id)
     job = status_store()["jobs"].setdefault(job_id, default_status_record())
 
     done_count = sum(1 for step in STATUS_STEPS if job["steps"].get(step, False))
@@ -796,7 +838,18 @@ def render_status_panel(job_id: str) -> None:
         for idx, step in enumerate(right_steps, start=4):
             st.checkbox(step, key=status_widget_key(job_id, idx))
 
+    st.markdown("#### Final Status")
+    st.caption("Use this separate block to close the job or flag it to IT.")
+    final_box = st.container(border=True)
+    with final_box:
+        fcol1, fcol2 = st.columns(2)
+        with fcol1:
+            st.checkbox(FINAL_STATUS_STEPS[0], key=final_status_widget_key(job_id, FINAL_STATUS_STEPS[0]))
+        with fcol2:
+            st.checkbox(FINAL_STATUS_STEPS[1], key=final_status_widget_key(job_id, FINAL_STATUS_STEPS[1]))
+
     sync_status_from_widgets(job_id)
+    sync_final_status_from_widgets(job_id)
     job = status_store()["jobs"][job_id]
 
     if job.get("updated_at"):
@@ -971,7 +1024,7 @@ if st.session_state.parsed_emails:
                 if item.date_utc and (latest_dt is None or item.date_utc > latest_dt):
                     latest_dt = item.date_utc
 
-            latest_is_stale = bool(latest_dt and (datetime.now(timezone.utc) - latest_dt) > timedelta(days=2))
+            latest_is_stale = bool(latest_dt and (datetime.now(timezone.utc) - latest_dt) > timedelta(days=2) and not job_final_status_active(st.session_state.search_term))
 
             st.download_button(
                 "⬇️ Download CSV",
