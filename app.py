@@ -309,9 +309,15 @@ def render_tracker_panel() -> Optional[str]:
     if selected_row.get("reference"):
         st.caption(selected_row["reference"])
 
+    names_for_completed_local = [
+        line.strip()
+        for line in re.split(r"[\n,;]+", st.session_state.get("names_text", "") or "")
+        if line.strip()
+    ]
+
     if st.button("Search selected ID", key="tracker_search_button", use_container_width=True):
         st.session_state["search_term_input"] = selected_id
-        execute_search(selected_id, names_for_completed)
+        execute_search(selected_id, names_for_completed_local)
 
     return selected_id
 
@@ -899,8 +905,6 @@ with st.sidebar:
     if st.button("Clear Search", use_container_width=True):
         reset_search()
 
-names_for_completed = [line.strip() for line in re.split(r"[\n,;]+", st.session_state.names_text or "") if line.strip()]
-
 uploaded = st.file_uploader(
     "Upload your exported mailbox",
     type=None,
@@ -935,7 +939,12 @@ if uploaded is not None:
         st.info(f"Mailbox already loaded: {len(st.session_state['parsed_emails'])} messages indexed.")
 
 if do_search:
-    execute_search(st.session_state.search_term_input, names_for_completed)
+    names_for_completed_main = [
+        line.strip()
+        for line in re.split(r"[\n,;]+", st.session_state.get("names_text", "") or "")
+        if line.strip()
+    ]
+    execute_search(st.session_state.search_term_input, names_for_completed_main)
 
 if st.session_state.parsed_emails:
     total = len(st.session_state.parsed_emails)
