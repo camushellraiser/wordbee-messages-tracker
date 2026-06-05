@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Optional
 
 import streamlit as st
+import openpyxl
 from bs4 import BeautifulSoup, NavigableString, Tag
 
 
@@ -162,6 +163,157 @@ def reset_search() -> None:
     st.session_state.search_term = ""
     st.session_state.search_results = []
     st.rerun()
+
+
+def parse_sheet_date(sheet_name: str):
+    clean = sheet_name.replace(",", "").strip()
+    for fmt in ("%B %d %Y", "%b %d %Y", "%B %d, %Y", "%b %d, %Y"):
+        try:
+            return datetime.strptime(clean, fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def extract_numeric_id(reference: str) -> Optional[str]:
+    if not reference:
+        return None
+    m = re.search(r"(?i)GTS(?:[-_\s]*)(\d+)", str(reference))
+    if m:
+        return m.group(1)
+    m = re.search(r"(\d{5,})", str(reference))
+    return m.group(1) if m else None
+
+
+def load_tracker_workbook(uploaded_bytes: bytes, filename: str) -> dict:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_path = Path(tmpdir) / filename
+        tmp_path.write_bytes(uploaded_bytes)
+        wb = openpyxl.load_workbook(tmp_path, data_only=True)
+
+        dated_sheets = []
+        for idx, sheet_name in enumerate(wb.sheetnames):
+            dt = parse_sheet_date(sheet_name)
+            if dt is not None:
+                dated_sheets.append((dt, idx, sheet_name))
+        if dated_sheets:
+            latest_sheet = sorted(dated_sheets, key=lambda x: (x[0], x[1]))[-1][2]
+        else:
+            latest_sheet = wb.sheetnames[0]
+
+        ws = wb[latest_sheet]
+
+        header_row = None
+        header_map = {}
+        for r in range(1, min(ws.max_row, 10) + 1):
+            row_vals = [ws.cell(r, c).value for c in range(1, ws.max_column + 1)]
+            norm = {str(v).strip().lower(): c for c, v in enumerate(row_vals, start=1) if v is not None}
+            if "reference" in norm and "person name" in norm:
+                header_row = r
+                header_map = norm
+                break
+        if header_row is None:
+            raise ValueError("Could not find Reference and Person Name columns in the latest sheet.")
+
+        ref_col = header_map["reference"]
+        person_col = header_map["person name"]
+
+        rows = []
+        for r in range(header_row + 1, ws.max_row + 1):
+            ref = ws.cell(r, ref_col).value
+            person = ws.cell(r, person_col).value
+            if not ref or not person:
+                continue
+            person_text = str(person).strip()
+            if "emmanuel" not in person_text.lower():
+                continue
+            job_id = extract_numeric_id(ref)
+            if not job_id:
+                continue
+            rows.append(
+                {
+                    "job_id": job_id,
+                    "reference": str(ref),
+                    "person_name": person_text,
+                    "row_number": r,
+                    "sheet_name": latest_sheet,
+                }
+            )
+
+        return {
+            "sheet_name": latest_sheet,
+            "sheet_count": len(wb.sheetnames),
+            "rows": rows,
+        }
+
+
+def tracker_store() -> dict:
+    if "tracker_store" not in st.session_state:
+        st.session_state["tracker_store"] = {"sheet_name": None, "sheet_count": 0, "rows": []}
+    return st.session_state["tracker_store"]
+
+
+def tracker_rows_by_id() -> dict:
+    store = tracker_store()
+    return {row["job_id"]: row for row in store.get("rows", [])}
+
+
+def load_tracker_into_state(uploaded_bytes: bytes, filename: str) -> None:
+    store = load_tracker_workbook(uploaded_bytes, filename)
+    st.session_state["tracker_store"] = store
+    st.session_state["tracker_source_name"] = filename
+    st.session_state["tracker_source_bytes"] = uploaded_bytes
+
+
+def execute_search(raw_term: str, names_for_completed: list[str]) -> None:
+    st.session_state["search_term"] = safe_search_id_from_term(raw_term)
+
+    if not st.session_state["search_term"]:
+        st.warning("Please enter the numeric job ID first.")
+        return
+    if not st.session_state["parsed_emails"]:
+        st.warning("Upload the mailbox file before searching.")
+        return
+
+    term = st.session_state["search_term"]
+    results = []
+    for item in st.session_state["parsed_emails"]:
+        matched, reason, completed_flag = match_message(item, term, names_for_completed)
+        if matched:
+            item.match_reason = reason
+            item.completed_flag = completed_flag
+            results.append(item)
+    st.session_state["search_results"] = sorted(
+        results,
+        key=lambda item: sort_key(item, st.session_state["sort_order"] == "Newest first"),
+    )
+
+
+def render_tracker_panel() -> Optional[str]:
+    store = tracker_store()
+    rows = store.get("rows", [])
+    if not rows:
+        st.markdown("### Tracker IDs")
+        st.info("Upload the Excel tracker to see Emmanuel IDs here.")
+        return None
+
+    st.markdown("### Tracker IDs")
+    st.caption(f"Latest sheet: {store.get('sheet_name')} • Emmanuel rows: {len(rows)}")
+
+    ids = [row["job_id"] for row in rows]
+    selected_id = st.selectbox("Emmanuel IDs", ids, key="tracker_selected_id")
+    selected_row = tracker_rows_by_id().get(selected_id, {})
+
+    st.code(selected_id)
+    st.caption("Copy/paste this ID into search.")
+    if selected_row.get("reference"):
+        st.caption(selected_row["reference"])
+
+    if st.button("Search selected ID", key="tracker_search_button", use_container_width=True):
+        st.session_state["search_term_input"] = selected_id
+        execute_search(selected_id, names_for_completed)
+
+    return selected_id
 
 
 def clean_text(text: str) -> str:
@@ -677,6 +829,12 @@ if "search_term_input" not in st.session_state:
     st.session_state["search_term_input"] = ""
 if "names_text" not in st.session_state:
     st.session_state["names_text"] = ""
+if "tracker_store" not in st.session_state:
+    st.session_state["tracker_store"] = {"sheet_name": None, "sheet_count": 0, "rows": []}
+if "tracker_source_name" not in st.session_state:
+    st.session_state["tracker_source_name"] = ""
+if "tracker_source_bytes" not in st.session_state:
+    st.session_state["tracker_source_bytes"] = b""
 if "status_store" not in st.session_state:
     st.session_state["status_store"] = {"version": STATUS_JSON_VERSION, "jobs": {}}
 if "status_source_name" not in st.session_state:
@@ -711,6 +869,26 @@ with st.sidebar:
                 st.success(f"Loaded status JSON: {len(st.session_state['status_store'].get('jobs', {}))} jobs")
             except Exception as exc:
                 st.error(f"Could not read the status JSON: {exc}")
+
+    st.markdown("### Tracker Excel")
+    tracker_upload = st.file_uploader(
+        "Upload Excel tracker",
+        type=["xlsx"],
+        help="Loads the newest sheet by date in the sheet name and keeps only Emmanuel rows.",
+    )
+    if tracker_upload is not None:
+        tracker_bytes = tracker_upload.getvalue()
+        if st.session_state.get("tracker_source_bytes") != tracker_bytes:
+            try:
+                load_tracker_into_state(tracker_bytes, tracker_upload.name)
+                st.success(
+                    f"Loaded tracker sheet: {st.session_state['tracker_store'].get('sheet_name')} "
+                    f"({len(st.session_state['tracker_store'].get('rows', []))} Emmanuel IDs)"
+                )
+            except Exception as exc:
+                st.error(f"Could not read the Excel tracker: {exc}")
+
+    render_tracker_panel()
 
     st.markdown("### Controls")
     st.session_state.sort_order = st.radio(
@@ -757,24 +935,7 @@ if uploaded is not None:
         st.info(f"Mailbox already loaded: {len(st.session_state['parsed_emails'])} messages indexed.")
 
 if do_search:
-    st.session_state.search_term = safe_search_id_from_term(st.session_state.search_term_input)
-    if not st.session_state.search_term:
-        st.warning("Please enter the numeric job ID first.")
-    elif not st.session_state.parsed_emails:
-        st.warning("Upload the mailbox file before searching.")
-    else:
-        term = st.session_state.search_term
-        results = []
-        for item in st.session_state.parsed_emails:
-            matched, reason, completed_flag = match_message(item, term, names_for_completed)
-            if matched:
-                item.match_reason = reason
-                item.completed_flag = completed_flag
-                results.append(item)
-        st.session_state.search_results = sorted(
-            results,
-            key=lambda item: sort_key(item, st.session_state.sort_order == "Newest first")
-        )
+    execute_search(st.session_state.search_term_input, names_for_completed)
 
 if st.session_state.parsed_emails:
     total = len(st.session_state.parsed_emails)

@@ -13,3 +13,4 @@ A polished Streamlit app for searching Apple Mail **mbox** exports from the `wor
 - Add a red **Action Required** badge on the same latest overdue result
 - Load and save a separate **status JSON** file with your checklist steps
 - Download matched results and updated status as files
+- Load an Excel tracker and surface Emmanuel IDs from the newest sheet
