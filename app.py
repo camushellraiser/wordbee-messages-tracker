@@ -157,6 +157,13 @@ class ParsedEmail:
     completed_flag: bool = False
 
 
+def reset_search() -> None:
+    st.session_state.search_term_input = ""
+    st.session_state.search_term = ""
+    st.session_state.search_results = []
+    st.rerun()
+
+
 def clean_text(text: str) -> str:
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     text = re.sub(r"\n{3,}", "\n\n", text)
