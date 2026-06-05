@@ -853,7 +853,7 @@ with st.sidebar:
         height=170,
     )
 
-    st.markdown("### Status JSON")
+        st.markdown("### Status JSON")
     status_upload = st.file_uploader(
         "Upload status JSON",
         type=["json"],
