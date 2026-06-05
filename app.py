@@ -1,5 +1,6 @@
 
 import csv
+import json
 import html
 import io
 import mailbox
@@ -96,6 +97,9 @@ class ParsedEmail:
     index: int
     subject: str
     sender: str
+    to: str
+    cc: str
+    reply_to: str
     date_utc: Optional[datetime]
     ids_in_order: list[str]
     display_id: Optional[str]
@@ -319,6 +323,9 @@ def sort_key(item: ParsedEmail, newest_first: bool):
 def parse_message(idx: int, msg: Message) -> ParsedEmail:
     subject = str(msg.get("subject", "(No subject)"))
     sender = str(msg.get("from", "(Unknown sender)"))
+    to = str(msg.get("to", ""))
+    cc = str(msg.get("cc", ""))
+    reply_to = str(msg.get("reply-to", ""))
     date_utc = parse_date(msg)
     html_body, plain_body = get_best_body(msg)
 
@@ -337,6 +344,9 @@ def parse_message(idx: int, msg: Message) -> ParsedEmail:
         index=idx,
         subject=subject,
         sender=sender,
+        to=to,
+        cc=cc,
+        reply_to=reply_to,
         date_utc=date_utc,
         ids_in_order=ids,
         display_id=display_id,
@@ -463,12 +473,60 @@ def render_result_card(item: ParsedEmail, search_term: str, highlight_latest: bo
         st.write("Extracted IDs:", item.ids_in_order or ["(none)"])
 
 
+
+def render_status_panel(job_id: str) -> None:
+    ensure_status_widgets(job_id)
+    job = status_store()["jobs"].setdefault(job_id, default_status_record())
+
+    done_count = sum(1 for step in STATUS_STEPS if job["steps"].get(step, False))
+    total_steps = len(STATUS_STEPS)
+    progress = done_count / total_steps if total_steps else 0.0
+
+    st.markdown("### Status")
+    st.caption(f"Job ID: {job_id}")
+    st.progress(progress)
+    st.write(f"{done_count}/{total_steps} steps completed")
+
+    col1, col2 = st.columns(2)
+    left_steps = STATUS_STEPS[:4]
+    right_steps = STATUS_STEPS[4:]
+
+    with col1:
+        for idx, step in enumerate(left_steps):
+            st.checkbox(step, key=status_widget_key(job_id, idx))
+
+    with col2:
+        for idx, step in enumerate(right_steps, start=4):
+            st.checkbox(step, key=status_widget_key(job_id, idx))
+
+    sync_status_from_widgets(job_id)
+    job = status_store()["jobs"][job_id]
+    updated_at = job.get("updated_at")
+    if updated_at:
+        st.caption(f"Last updated: {updated_at}")
+
+    btn1, btn2 = st.columns(2)
+    with btn1:
+        if st.button("Reset this job", key=f"reset_status_{job_id}", use_container_width=True):
+            reset_status_for_job(job_id)
+            st.rerun()
+    with btn2:
+        st.download_button(
+            "Download status JSON",
+            data=export_status_json(),
+            file_name="wordbee_status.json",
+            mime="application/json",
+            use_container_width=True,
+        )
 st.session_state.setdefault("parsed_emails", [])
 st.session_state.setdefault("search_term", "")
 st.session_state.setdefault("search_results", [])
 st.session_state.setdefault("sort_order", "Oldest first")
 st.session_state.setdefault("search_term_input", "")
 st.session_state.setdefault("names_text", "")
+st.session_state.setdefault("status_store", {"version": STATUS_JSON_VERSION, "jobs": {}})
+st.session_state.setdefault("status_source_name", "")
+st.session_state.setdefault("status_source_bytes", b"")
 
 st.markdown("<div class='hero'><h1>Wordbee Message Tracker</h1></div>", unsafe_allow_html=True)
 
@@ -480,6 +538,23 @@ with st.sidebar:
         placeholder="Hiromi Weston\nJoseph Massaro\nEmmanuel Lizares",
         height=170,
     )
+
+    st.markdown("### Status JSON")
+    status_upload = st.file_uploader(
+        "Upload status JSON",
+        type=["json"],
+        help="Load yesterday's status file so progress is preserved across daily mailbox uploads.",
+    )
+    if status_upload is not None:
+        status_bytes = status_upload.getvalue()
+        if st.session_state.get("status_source_bytes") != status_bytes:
+            try:
+                st.session_state.status_store = load_status_json(status_bytes)
+                st.session_state.status_source_bytes = status_bytes
+                st.session_state.status_source_name = status_upload.name
+                st.success(f"Loaded status JSON: {len(st.session_state.status_store.get('jobs', {}))} jobs")
+            except Exception as exc:
+                st.error(f"Could not read the status JSON: {exc}")
 
     st.markdown("### Controls")
     st.session_state.sort_order = st.radio("Sort order", ["Oldest first", "Newest first"], index=0 if st.session_state.sort_order == "Oldest first" else 1)
