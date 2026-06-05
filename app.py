@@ -1,8 +1,8 @@
 
 import csv
-import json
 import html
 import io
+import json
 import mailbox
 import re
 import tempfile
@@ -46,16 +46,6 @@ st.markdown(
         font-size: 2rem;
         line-height: 1.1;
       }
-      .card-title {
-        font-size: 1.02rem;
-        font-weight: 800;
-        color: #0f172a;
-        margin-bottom: 0.25rem;
-      }
-      .muted {
-        color: #6b7280;
-        font-size: 0.92rem;
-      }
       .msg-box {
         border: 1px solid #e5e7eb;
         border-radius: 16px;
@@ -79,6 +69,52 @@ st.markdown(
         overflow-wrap: normal;
         word-break: normal;
       }
+      .title {
+        font-size: 1.02rem;
+        font-weight: 800;
+        color: #0f172a;
+        margin-bottom: 0.3rem;
+      }
+      .meta {
+        color: #6b7280;
+        font-size: 0.88rem;
+        margin-bottom: 0.4rem;
+      }
+      .pill {
+        display: inline-block;
+        background: #e0f2fe;
+        color: #075985;
+        padding: 0.28rem 0.58rem;
+        border-radius: 999px;
+        font-size: 0.81rem;
+        font-weight: 700;
+        margin-right: 0.35rem;
+        margin-bottom: 0.25rem;
+      }
+      .pill-green {
+        display: inline-block;
+        background: #dcfce7;
+        color: #166534;
+        padding: 0.28rem 0.58rem;
+        border-radius: 999px;
+        font-size: 0.81rem;
+        font-weight: 700;
+        margin-right: 0.35rem;
+        margin-bottom: 0.25rem;
+      }
+      .pill-red {
+        display: inline-block;
+        background: #fee2e2;
+        color: #991b1b;
+        padding: 0.28rem 0.58rem;
+        border-radius: 999px;
+        font-size: 0.81rem;
+        font-weight: 800;
+        margin-right: 0.35rem;
+        margin-bottom: 0.25rem;
+      }
+      .date-red { color: #b91c1c; font-weight: 800; }
+      .date-muted { color: #6b7280; }
       div[data-baseweb="input"] input { border-radius: 14px !important; }
       div[data-baseweb="textarea"] textarea { border-radius: 14px !important; }
       .stDownloadButton button { border-radius: 14px !important; font-weight: 700; }
@@ -90,6 +126,18 @@ st.markdown(
 GTS_RE = re.compile(r"(?i)GTS(?:[-_\s]*)(\d+)")
 DASH_LINE_RE = re.compile(r"^\s*-{8,}\s*$")
 COMPLETED_RE = re.compile(r"(?i)\b(?:job\s+has\s+been\s+completed|the\s+job\s+has\s+been\s+completed|work\s+completed)\b")
+
+STATUS_STEPS = [
+    "Rename order",
+    "Generate source files",
+    "Import translated content",
+    "Run functional review",
+    "Assign to LSO",
+    "Check if LSO is done",
+    "Promote and Publish",
+    "Check Published content",
+]
+STATUS_JSON_VERSION = 1
 
 
 @dataclass
@@ -107,13 +155,6 @@ class ParsedEmail:
     full_text: str
     match_reason: str = ""
     completed_flag: bool = False
-
-
-def reset_search() -> None:
-    st.session_state.search_term_input = ""
-    st.session_state.search_term = ""
-    st.session_state.search_results = []
-    st.rerun()
 
 
 def clean_text(text: str) -> str:
@@ -407,7 +448,6 @@ def parse_uploaded_file(uploaded_bytes: bytes, filename: str) -> list[ParsedEmai
 
 
 def completion_search_text(item: ParsedEmail) -> str:
-    # Search across the full message headers + body, not just the body.
     return "\n".join([item.subject, item.sender, item.to, item.cc, item.reply_to, item.full_text])
 
 
@@ -436,12 +476,15 @@ def match_message(item: ParsedEmail, term: str, names_for_completed: list[str]) 
 def build_csv(rows: list[ParsedEmail], search_term: str) -> bytes:
     buf = io.StringIO()
     writer = csv.writer(buf)
-    writer.writerow(["search_term", "subject", "from", "date", "matched_id", "match_reason", "completed_flag", "excerpt"])
+    writer.writerow(["search_term", "subject", "from", "to", "cc", "reply_to", "date", "matched_id", "match_reason", "completed_flag", "excerpt"])
     for r in rows:
         writer.writerow([
             search_term,
             r.subject,
             r.sender,
+            r.to,
+            r.cc,
+            r.reply_to,
             fmt_dt(r.date_utc),
             r.display_id or "",
             r.match_reason,
@@ -449,6 +492,97 @@ def build_csv(rows: list[ParsedEmail], search_term: str) -> bytes:
             r.body_markdown,
         ])
     return buf.getvalue().encode("utf-8")
+
+
+def default_status_record() -> dict:
+    return {
+        "steps": {step: False for step in STATUS_STEPS},
+        "updated_at": None,
+    }
+
+
+def normalize_status_record(record) -> dict:
+    normalized = default_status_record()
+    if not isinstance(record, dict):
+        return normalized
+
+    steps = record.get("steps") if isinstance(record.get("steps"), dict) else record
+    if isinstance(steps, dict):
+        for step in STATUS_STEPS:
+            normalized["steps"][step] = bool(steps.get(step, False))
+
+    updated_at = record.get("updated_at")
+    if isinstance(updated_at, str):
+        normalized["updated_at"] = updated_at
+
+    return normalized
+
+
+def normalize_status_store(raw) -> dict:
+    store = {"version": STATUS_JSON_VERSION, "jobs": {}}
+    if not isinstance(raw, dict):
+        return store
+
+    if isinstance(raw.get("jobs"), dict):
+        store["version"] = int(raw.get("version", STATUS_JSON_VERSION))
+        for job_id, record in raw["jobs"].items():
+            store["jobs"][str(job_id)] = normalize_status_record(record)
+        return store
+
+    for job_id, record in raw.items():
+        if job_id in {"version", "updated_at"}:
+            continue
+        store["jobs"][str(job_id)] = normalize_status_record(record)
+    return store
+
+
+def status_store() -> dict:
+    if "status_store" not in st.session_state:
+        st.session_state["status_store"] = {"version": STATUS_JSON_VERSION, "jobs": {}}
+    return st.session_state["status_store"]
+
+
+def status_widget_key(job_id: str, step_index: int) -> str:
+    return f"status::{job_id}::{step_index}"
+
+
+def ensure_status_widgets(job_id: str) -> None:
+    job = status_store()["jobs"].setdefault(job_id, default_status_record())
+    for idx, step in enumerate(STATUS_STEPS):
+        key = status_widget_key(job_id, idx)
+        if key not in st.session_state:
+            st.session_state[key] = bool(job["steps"].get(step, False))
+
+
+def sync_status_from_widgets(job_id: str) -> None:
+    store = status_store()
+    job = store["jobs"].setdefault(job_id, default_status_record())
+    for idx, step in enumerate(STATUS_STEPS):
+        job["steps"][step] = bool(st.session_state.get(status_widget_key(job_id, idx), False))
+    job["updated_at"] = datetime.now(timezone.utc).isoformat()
+    store["jobs"][job_id] = job
+
+
+def reset_status_for_job(job_id: str) -> None:
+    store = status_store()
+    store["jobs"][job_id] = default_status_record()
+    for idx, _step in enumerate(STATUS_STEPS):
+        st.session_state[status_widget_key(job_id, idx)] = False
+
+
+def export_status_json() -> bytes:
+    store = status_store()
+    payload = {
+        "version": store.get("version", STATUS_JSON_VERSION),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "jobs": store.get("jobs", {}),
+    }
+    return json.dumps(payload, indent=2, ensure_ascii=False).encode("utf-8")
+
+
+def load_status_json(raw_bytes: bytes) -> dict:
+    raw = json.loads(raw_bytes.decode("utf-8"))
+    return normalize_status_store(raw)
 
 
 def render_result_card(item: ParsedEmail, search_term: str, highlight_latest: bool, latest_stale: bool) -> None:
@@ -473,7 +607,6 @@ def render_result_card(item: ParsedEmail, search_term: str, highlight_latest: bo
         st.write("Extracted IDs:", item.ids_in_order or ["(none)"])
 
 
-
 def render_status_panel(job_id: str) -> None:
     ensure_status_widgets(job_id)
     job = status_store()["jobs"].setdefault(job_id, default_status_record())
@@ -487,23 +620,22 @@ def render_status_panel(job_id: str) -> None:
     st.progress(progress)
     st.write(f"{done_count}/{total_steps} steps completed")
 
-    col1, col2 = st.columns(2)
+    left_col, right_col = st.columns(2)
     left_steps = STATUS_STEPS[:4]
     right_steps = STATUS_STEPS[4:]
 
-    with col1:
+    with left_col:
         for idx, step in enumerate(left_steps):
             st.checkbox(step, key=status_widget_key(job_id, idx))
-
-    with col2:
+    with right_col:
         for idx, step in enumerate(right_steps, start=4):
             st.checkbox(step, key=status_widget_key(job_id, idx))
 
     sync_status_from_widgets(job_id)
     job = status_store()["jobs"][job_id]
-    updated_at = job.get("updated_at")
-    if updated_at:
-        st.caption(f"Last updated: {updated_at}")
+
+    if job.get("updated_at"):
+        st.caption(f"Last updated: {job['updated_at']}")
 
     btn1, btn2 = st.columns(2)
     with btn1:
@@ -518,15 +650,32 @@ def render_status_panel(job_id: str) -> None:
             mime="application/json",
             use_container_width=True,
         )
-st.session_state.setdefault("parsed_emails", [])
-st.session_state.setdefault("search_term", "")
-st.session_state.setdefault("search_results", [])
-st.session_state.setdefault("sort_order", "Oldest first")
-st.session_state.setdefault("search_term_input", "")
-st.session_state.setdefault("names_text", "")
-st.session_state.setdefault("status_store", {"version": STATUS_JSON_VERSION, "jobs": {}})
-st.session_state.setdefault("status_source_name", "")
-st.session_state.setdefault("status_source_bytes", b"")
+
+
+def safe_search_id_from_term(term: str) -> str:
+    digits = re.sub(r"\D+", "", term or "")
+    return digits
+
+
+# Session state defaults
+if "parsed_emails" not in st.session_state:
+    st.session_state["parsed_emails"] = []
+if "search_term" not in st.session_state:
+    st.session_state["search_term"] = ""
+if "search_results" not in st.session_state:
+    st.session_state["search_results"] = []
+if "sort_order" not in st.session_state:
+    st.session_state["sort_order"] = "Oldest first"
+if "search_term_input" not in st.session_state:
+    st.session_state["search_term_input"] = ""
+if "names_text" not in st.session_state:
+    st.session_state["names_text"] = ""
+if "status_store" not in st.session_state:
+    st.session_state["status_store"] = {"version": STATUS_JSON_VERSION, "jobs": {}}
+if "status_source_name" not in st.session_state:
+    st.session_state["status_source_name"] = ""
+if "status_source_bytes" not in st.session_state:
+    st.session_state["status_source_bytes"] = b""
 
 st.markdown("<div class='hero'><h1>Wordbee Message Tracker</h1></div>", unsafe_allow_html=True)
 
@@ -549,15 +698,19 @@ with st.sidebar:
         status_bytes = status_upload.getvalue()
         if st.session_state.get("status_source_bytes") != status_bytes:
             try:
-                st.session_state.status_store = load_status_json(status_bytes)
-                st.session_state.status_source_bytes = status_bytes
-                st.session_state.status_source_name = status_upload.name
-                st.success(f"Loaded status JSON: {len(st.session_state.status_store.get('jobs', {}))} jobs")
+                st.session_state["status_store"] = load_status_json(status_bytes)
+                st.session_state["status_source_bytes"] = status_bytes
+                st.session_state["status_source_name"] = status_upload.name
+                st.success(f"Loaded status JSON: {len(st.session_state['status_store'].get('jobs', {}))} jobs")
             except Exception as exc:
                 st.error(f"Could not read the status JSON: {exc}")
 
     st.markdown("### Controls")
-    st.session_state.sort_order = st.radio("Sort order", ["Oldest first", "Newest first"], index=0 if st.session_state.sort_order == "Oldest first" else 1)
+    st.session_state.sort_order = st.radio(
+        "Sort order",
+        ["Oldest first", "Newest first"],
+        index=0 if st.session_state.sort_order == "Oldest first" else 1,
+    )
     if st.button("Clear Search", use_container_width=True):
         reset_search()
 
@@ -584,20 +737,20 @@ if uploaded is not None:
     needs_parse = st.session_state.get("uploaded_name") != uploaded.name or st.session_state.get("uploaded_bytes") != uploaded.getvalue()
     if needs_parse:
         with st.spinner("Reading mailbox and indexing messages..."):
-            st.session_state.uploaded_name = uploaded.name
-            st.session_state.uploaded_bytes = uploaded.getvalue()
+            st.session_state["uploaded_name"] = uploaded.name
+            st.session_state["uploaded_bytes"] = uploaded.getvalue()
             try:
-                st.session_state.parsed_emails = parse_uploaded_file(uploaded.getvalue(), uploaded.name)
+                st.session_state["parsed_emails"] = parse_uploaded_file(uploaded.getvalue(), uploaded.name)
             except Exception as e:
-                st.session_state.parsed_emails = []
+                st.session_state["parsed_emails"] = []
                 st.error(f"Could not parse the uploaded file: {e}")
-            st.session_state.search_results = []
-        st.success(f"Mailbox indexed: {len(st.session_state.parsed_emails)} messages ready.")
-    elif st.session_state.parsed_emails:
-        st.info(f"Mailbox already loaded: {len(st.session_state.parsed_emails)} messages indexed.")
+            st.session_state["search_results"] = []
+        st.success(f"Mailbox indexed: {len(st.session_state['parsed_emails'])} messages ready.")
+    elif st.session_state["parsed_emails"]:
+        st.info(f"Mailbox already loaded: {len(st.session_state['parsed_emails'])} messages indexed.")
 
 if do_search:
-    st.session_state.search_term = re.sub(r"\D+", "", (st.session_state.search_term_input or "").strip())
+    st.session_state.search_term = safe_search_id_from_term(st.session_state.search_term_input)
     if not st.session_state.search_term:
         st.warning("Please enter the numeric job ID first.")
     elif not st.session_state.parsed_emails:
@@ -611,7 +764,10 @@ if do_search:
                 item.match_reason = reason
                 item.completed_flag = completed_flag
                 results.append(item)
-        st.session_state.search_results = sorted(results, key=lambda item: sort_key(item, st.session_state.sort_order == "Newest first"))
+        st.session_state.search_results = sorted(
+            results,
+            key=lambda item: sort_key(item, st.session_state.sort_order == "Newest first")
+        )
 
 if st.session_state.parsed_emails:
     total = len(st.session_state.parsed_emails)
@@ -626,28 +782,43 @@ if st.session_state.parsed_emails:
     if st.session_state.search_term and not st.session_state.search_results and do_search:
         st.info("No messages matched that identifier.")
 
-    if st.session_state.search_results:
-        st.markdown(f"### Results for `{st.session_state.search_term}`")
-        st.caption("Displayed in the order you selected. Each card shows only the content between the dashed separator lines.")
+    left_col, right_col = st.columns([1.35, 0.85], gap="large")
 
-        latest_dt = None
-        for item in st.session_state.search_results:
-            if item.date_utc and (latest_dt is None or item.date_utc > latest_dt):
-                latest_dt = item.date_utc
+    with left_col:
+        if st.session_state.search_results:
+            st.markdown(f"### Results for `{st.session_state.search_term}`")
+            st.caption("Displayed in the order you selected. Each card shows only the content between the dashed separator lines.")
 
-        now_utc = datetime.now(timezone.utc)
-        latest_is_stale = bool(latest_dt and (now_utc - latest_dt) > timedelta(days=2))
+            latest_dt = None
+            for item in st.session_state.search_results:
+                if item.date_utc and (latest_dt is None or item.date_utc > latest_dt):
+                    latest_dt = item.date_utc
 
-        st.download_button(
-            "⬇️ Download CSV",
-            data=build_csv(st.session_state.search_results, st.session_state.search_term),
-            file_name=f"wordbee_matches_{st.session_state.search_term}.csv",
-            mime="text/csv",
-        )
-        for item in st.session_state.search_results:
-            render_result_card(item, st.session_state.search_term, highlight_latest=(item.date_utc == latest_dt), latest_stale=latest_is_stale)
-    elif st.session_state.search_term:
-        st.markdown("### No matches yet")
-        st.caption("Try another numeric ID, or confirm the email contains a supported GTS identifier.")
+            latest_is_stale = bool(latest_dt and (datetime.now(timezone.utc) - latest_dt) > timedelta(days=2))
+
+            st.download_button(
+                "⬇️ Download CSV",
+                data=build_csv(st.session_state.search_results, st.session_state.search_term),
+                file_name=f"wordbee_matches_{st.session_state.search_term}.csv",
+                mime="text/csv",
+            )
+
+            for item in st.session_state.search_results:
+                render_result_card(
+                    item,
+                    st.session_state.search_term,
+                    highlight_latest=(item.date_utc == latest_dt),
+                    latest_stale=latest_is_stale,
+                )
+        elif st.session_state.search_term:
+            st.markdown("### No matches yet")
+            st.caption("Try another numeric ID, or confirm the email contains a supported GTS identifier.")
+
+    with right_col:
+        if st.session_state.search_term:
+            render_status_panel(st.session_state.search_term)
+        else:
+            st.markdown("### Status")
+            st.info("Search a Job ID to load its checklist here.")
 else:
     st.info("Upload the exported mailbox file to begin.")
